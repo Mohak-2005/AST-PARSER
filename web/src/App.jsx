@@ -5,7 +5,7 @@ import ProgressPanel from './components/ProgressPanel';
 import GraphView from './components/GraphView';
 import NodeDetails from './components/NodeDetails';
 import EdgeDetails from './components/EdgeDetails';
-import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext } from './api/client';
+import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext, checkFeatureContext } from './api/client';
 import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 
 export default function App() {
@@ -19,11 +19,11 @@ export default function App() {
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [graphLookup, setGraphLookup] = useState(null);
 
-  // Feature Context Generation state — idle | loading | success | error
-  const [featureCtx, setFeatureCtx] = useState({ status: 'idle', message: null, data: null });
+  // Feature Context Generation state — idle | loading | already_exists | success | error
+  const [featureCtx, setFeatureCtx] = useState({ status: 'idle', step: 'idle', message: null, data: null });
 
   const handleGenerateFeatureContext = async () => {
-    // Prevent duplicate requests
+    // Prevent duplicate requests while running
     if (featureCtx.status === 'loading') return;
 
     // Read codeMapPath from the already-loaded code map (set by agent's codeMapBuilder.js)
@@ -35,23 +35,67 @@ export default function App() {
     if (!codeMapPath && !projectId) {
       setFeatureCtx({
         status: 'error',
+        step: 'idle',
         message: 'No code map path available for this project. Re-analyze to enable feature context generation.',
         data: null,
       });
       return;
     }
 
-    setFeatureCtx({ status: 'loading', message: null, data: null });
+    const payload = { codeMapPath, projectId };
+
+    // STEP 1: Check whether feature contexts already exist FIRST
+    setFeatureCtx({ status: 'loading', step: 'checking', message: 'Checking existing feature context…', data: null });
+
     try {
-      const { data } = await generateFeatureContext({ codeMapPath, projectId });
-      setFeatureCtx({ status: 'success', message: data.message, data });
+      const checkRes = await checkFeatureContext(payload);
+      if (checkRes.data?.alreadyExists) {
+        // IF THEY EXIST: Show "Feature context already generated for N features." and STOP. LLM is NOT called.
+        setFeatureCtx({
+          status: 'already_exists',
+          step: 'done',
+          message: checkRes.data.message || `Feature context already generated for ${checkRes.data.featureCount} features.`,
+          data: checkRes.data,
+        });
+        return;
+      }
+    } catch (checkErr) {
+      console.warn('[FeatureContext] Check notice:', checkErr);
+      // Proceed to generate if check endpoint had temporary issue
+    }
+
+    // STEP 2: IF THEY DO NOT EXIST: Show "Generating Feature Context..." and invoke generator
+    setFeatureCtx({
+      status: 'loading',
+      step: 'generating',
+      message: 'Generating Feature Context...',
+      data: null,
+    });
+
+    try {
+      const { data } = await generateFeatureContext(payload);
+      if (data.alreadyExists) {
+        setFeatureCtx({
+          status: 'already_exists',
+          step: 'done',
+          message: data.message || `Feature context already generated for ${data.featureCount} features.`,
+          data,
+        });
+      } else {
+        setFeatureCtx({
+          status: 'success',
+          step: 'done',
+          message: data.message || `Feature context generated successfully for ${data.featureCount} features.`,
+          data,
+        });
+      }
     } catch (err) {
       const errMsg =
         err.response?.data?.detail ||
         err.response?.data?.error ||
         err.message ||
         'Feature context generation failed';
-      setFeatureCtx({ status: 'error', message: errMsg, data: null });
+      setFeatureCtx({ status: 'error', step: 'idle', message: errMsg, data: null });
     }
   };
 
@@ -190,15 +234,17 @@ export default function App() {
               >
                 {featureCtx.status === 'loading' ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
-                ) : featureCtx.status === 'success' ? (
-                  <CheckCircle2 className="w-4 h-4" />
+                ) : featureCtx.status === 'already_exists' || featureCtx.status === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-300" />
                 ) : featureCtx.status === 'error' ? (
                   <AlertCircle className="w-4 h-4" />
                 ) : (
                   <Sparkles className="w-4 h-4" />
                 )}
                 {featureCtx.status === 'loading'
-                  ? 'Generating Feature Context…'
+                  ? 'Generating Feature Context...'
+                  : featureCtx.status === 'already_exists'
+                  ? 'Feature Context Already Generated'
                   : featureCtx.status === 'success'
                   ? 'Feature Context Generated'
                   : 'Generate Feature Context'}
@@ -220,22 +266,17 @@ export default function App() {
         {view === 'graph' && featureCtx.status !== 'idle' && (
           <div
             className={`text-xs px-2 pb-2 flex items-center gap-2 ${
-              featureCtx.status === 'success'
+              featureCtx.status === 'success' || featureCtx.status === 'already_exists'
                 ? 'text-emerald-400'
                 : featureCtx.status === 'error'
                 ? 'text-red-400'
                 : 'text-slate-400'
             }`}
           >
-            {featureCtx.status === 'success' && (
+            {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
               <>
                 <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
                 {featureCtx.message}
-                {featureCtx.data?.featureCount != null && (
-                  <span className="ml-1 font-semibold">
-                    ({featureCtx.data.featureCount} feature{featureCtx.data.featureCount !== 1 ? 's' : ''})
-                  </span>
-                )}
               </>
             )}
             {featureCtx.status === 'error' && (
@@ -247,7 +288,7 @@ export default function App() {
             {featureCtx.status === 'loading' && (
               <>
                 <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
-                Discovering features and generating context files…
+                {featureCtx.message || 'Generating Feature Context...'}
               </>
             )}
           </div>

@@ -3,6 +3,7 @@ import uuid
 import traceback
 import asyncio
 from pathlib import Path
+from typing import Optional, Union
 from fastapi import APIRouter, HTTPException
 from app.models.schemas import (
     CodeMapPayload,
@@ -14,7 +15,10 @@ from app.models.schemas import (
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
 from app.services.db_repository import save_project, save_graph, get_graph
-from app.services.feature_context_generator import generate_all_feature_contexts
+from app.services.feature_context_generator import (
+    generate_all_feature_contexts,
+    get_existing_feature_contexts,
+)
 from app.logger import backend_logger, log_stage, log_error
 
 router = APIRouter()
@@ -140,44 +144,82 @@ async def analyze(payload: CodeMapPayload):
     return AnalyzeResponse(projectId=project_id, graph=graph, message="Analysis complete")
 
 
-@router.post("/api/feature-context", response_model=FeatureContextResponse)
-async def create_feature_contexts_endpoint(req: FeatureContextRequest):
-    code_map_path = req.codeMapPath
-    code_map_source = code_map_path
-
-    if not code_map_source and req.projectId:
-        graph = await get_graph(req.projectId)
+async def _resolve_code_map_source(code_map_path: Optional[str], project_id: Optional[str]) -> Optional[Union[str, dict]]:
+    """Helper to resolve the code-map file path or dict from codeMapPath or projectId."""
+    if code_map_path:
+        return code_map_path
+    if project_id:
+        graph = await get_graph(project_id)
         if graph and graph.get("codeMap"):
             cm = graph["codeMap"]
-            cand_path = (
-                cm.get("project", {}).get("codeMapPath")
-                or cm.get("codeMapPath")
-            )
+            cand_path = cm.get("project", {}).get("codeMapPath") or cm.get("codeMapPath")
             if cand_path and Path(cand_path).exists():
-                code_map_source = cand_path
-            else:
-                # If project name exists, check test output folder
-                p_name = graph.get("projectName")
-                if p_name:
-                    fallback_file = Path("C:/Users/Mohak/Desktop/test") / p_name / "repository-code-map.json"
-                    if fallback_file.exists():
-                        code_map_source = str(fallback_file)
-                    else:
-                        code_map_source = cm
-                else:
-                    code_map_source = cm
+                return cand_path
+            p_name = graph.get("projectName")
+            if p_name:
+                fallback_file = Path("C:/Users/Mohak/Desktop/test") / p_name / "repository-code-map.json"
+                if fallback_file.exists():
+                    return str(fallback_file)
+            return cm
+    return None
 
+
+@router.get("/api/feature-context", response_model=FeatureContextResponse)
+async def check_feature_contexts_endpoint(
+    codeMapPath: Optional[str] = None,
+    projectId: Optional[str] = None,
+):
+    code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
     if not code_map_source:
         raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
 
+    existing_files = get_existing_feature_contexts(code_map_source)
+    if existing_files:
+        return FeatureContextResponse(
+            status="already_exists",
+            alreadyExists=True,
+            featureCount=len(existing_files),
+            savedFiles=[f.name for f in existing_files],
+            message=f"Feature context already generated for {len(existing_files)} features.",
+        )
+    return FeatureContextResponse(
+        status="not_found",
+        alreadyExists=False,
+        featureCount=0,
+        savedFiles=[],
+        message="No feature context generated yet.",
+    )
+
+
+@router.post("/api/feature-context", response_model=FeatureContextResponse)
+async def create_feature_contexts_endpoint(req: FeatureContextRequest):
+    code_map_source = await _resolve_code_map_source(req.codeMapPath, req.projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    # Double-check existing files before invoking LLM if not forced
+    if not req.force:
+        existing_files = get_existing_feature_contexts(code_map_source)
+        if existing_files:
+            return FeatureContextResponse(
+                status="already_exists",
+                alreadyExists=True,
+                featureCount=len(existing_files),
+                savedFiles=[f.name for f in existing_files],
+                message=f"Feature context already generated for {len(existing_files)} features.",
+            )
+
     try:
-        contexts = await generate_all_feature_contexts(code_map_source)
-        saved_files = [f"{c['feature']['id']}.json" for c in contexts]
+        contexts = await generate_all_feature_contexts(code_map_source, force=bool(req.force))
+        saved_files = [
+            f"{c.get('feature', {}).get('id') or 'feature'}.json" for c in contexts
+        ]
         return FeatureContextResponse(
             status="success",
+            alreadyExists=False,
             featureCount=len(contexts),
             savedFiles=saved_files,
-            message=f"Generated {len(contexts)} feature contexts"
+            message=f"Feature context generated successfully for {len(contexts)} features.",
         )
     except Exception as exc:
         backend_logger.error(f"[FeatureContext] Endpoint error: {exc}")

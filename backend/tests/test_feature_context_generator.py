@@ -31,6 +31,7 @@ from app.services.feature_context_generator import (
     validate_feature_context,
     save_feature_contexts,
     generate_all_feature_contexts,
+    get_existing_feature_contexts,
     fallback_feature_discovery,
     _graph_based_flow_fallback,
     _split_component,
@@ -687,6 +688,60 @@ class TestFeatureContextGenerator(unittest.TestCase):
             self.assertIn("feature", ctx)
             self.assertIn("files", ctx)
             self.assertIn("featureFlow", ctx)
+
+    def test_get_existing_feature_contexts_none_when_no_dir(self):
+        """When feature-context/ directory doesn't exist, returns empty list."""
+        found = get_existing_feature_contexts(self.code_map_path)
+        self.assertEqual(found, [])
+
+    def test_get_existing_feature_contexts_none_when_empty_or_invalid(self):
+        """When feature-context/ is empty or contains corrupt files, returns empty list."""
+        fc_dir = self.test_dir / "feature-context"
+        fc_dir.mkdir(parents=True, exist_ok=True)
+        # Empty file
+        (fc_dir / "empty.json").write_text("", encoding="utf-8")
+        # Invalid json
+        (fc_dir / "bad.json").write_text("{not valid json", encoding="utf-8")
+        # Json missing required fields
+        (fc_dir / "incomplete.json").write_text(json.dumps({"some": "data"}), encoding="utf-8")
+        # Json with empty files list
+        (fc_dir / "no_files.json").write_text(json.dumps({"feature": {"name": "X"}, "files": []}), encoding="utf-8")
+
+        found = get_existing_feature_contexts(self.code_map_path)
+        self.assertEqual(found, [])
+
+    def test_get_existing_feature_contexts_detects_valid_files(self):
+        """When valid feature context JSON files exist, detects them and returns paths."""
+        fc_dir = self.test_dir / "feature-context"
+        fc_dir.mkdir(parents=True, exist_ok=True)
+        valid_data = {
+            "feature": {"id": "feat-1", "name": "Feature One"},
+            "files": [{"path": "server/routes/auth.ts", "role": "API Route Handler"}]
+        }
+        (fc_dir / "feature-one.json").write_text(json.dumps(valid_data), encoding="utf-8")
+
+        found = get_existing_feature_contexts(self.code_map_path)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].name, "feature-one.json")
+
+    @patch("app.services.feature_context_generator.execute_hf_llm_call")
+    def test_generate_all_feature_contexts_skips_llm_when_existing(self, mock_llm):
+        """When valid files exist and force=False, returns them WITHOUT calling Hugging Face LLM."""
+        fc_dir = self.test_dir / "feature-context"
+        fc_dir.mkdir(parents=True, exist_ok=True)
+        valid_data = {
+            "feature": {"id": "feat-existing", "name": "Existing Feature"},
+            "files": [{"path": "server/routes/auth.ts", "role": "API Route Handler"}]
+        }
+        (fc_dir / "existing.json").write_text(json.dumps(valid_data), encoding="utf-8")
+
+        import asyncio
+        contexts = asyncio.run(generate_all_feature_contexts(self.code_map_path, force=False))
+
+        # LLM must NOT be called
+        mock_llm.assert_not_called()
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0]["feature"]["name"], "Existing Feature")
 
 
 if __name__ == "__main__":

@@ -15,8 +15,14 @@ export const getGraph = (projectId) => backendApi.get(`/api/graph/${projectId}`)
 export const getProjects = () => backendApi.get('/api/projects');
 export const checkBackendHealth = () => backendApi.get('/api/health');
 
+// Checks whether valid feature-context files already exist for the current project.
+export const checkFeatureContext = (params) =>
+  backendApi.get('/api/feature-context', {
+    params: typeof params === 'string' ? { codeMapPath: params } : params,
+  });
+
 // Triggers the existing Feature Context Generation service for the current project.
-// Accepts codeMapPath string or object with { codeMapPath, projectId }.
+// Accepts codeMapPath string or object with { codeMapPath, projectId, force }.
 export const generateFeatureContext = (params) =>
   backendApi.post(
     '/api/feature-context',

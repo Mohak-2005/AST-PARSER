@@ -1198,21 +1198,109 @@ def save_feature_contexts(code_map_path: Path, contexts: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Existing context detection
+# ---------------------------------------------------------------------------
+
+def get_existing_feature_contexts(code_map_source: Union[str, Path, dict]) -> List[Path]:
+    """
+    Dynamically inspects <directory containing repository-code-map.json>/feature-context/
+    to detect any valid, previously generated feature-context JSON files.
+
+    A file is considered valid if:
+    - It has a .json extension
+    - It parses as valid JSON
+    - It contains a 'feature' dict with 'id' or 'name'
+    - It contains a 'files' list
+
+    Returns a list of Path objects for all valid feature context files found.
+    """
+    code_map_path: Optional[Path] = None
+    if isinstance(code_map_source, (str, Path)):
+        resolved = Path(code_map_source).resolve()
+        code_map_path = (
+            resolved if resolved.is_file()
+            else (resolved / "repository-code-map.json" if (resolved / "repository-code-map.json").exists() else resolved)
+        )
+    elif isinstance(code_map_source, dict):
+        cand = (
+            code_map_source.get("project", {}).get("codeMapPath")
+            or code_map_source.get("codeMapPath")
+        )
+        if cand:
+            code_map_path = Path(cand).resolve()
+
+    if not code_map_path:
+        return []
+
+    target_dir = code_map_path.parent if code_map_path.suffix == ".json" else code_map_path
+    fc_dir = target_dir / "feature-context"
+
+    if not fc_dir.exists() or not fc_dir.is_dir():
+        return []
+
+    valid_files: List[Path] = []
+    for json_file in fc_dir.glob("*.json"):
+        if not json_file.is_file():
+            continue
+        try:
+            with open(json_file, "r", encoding="utf-8") as fh:
+                content = json.load(fh)
+                if (
+                    isinstance(content, dict)
+                    and "feature" in content
+                    and isinstance(content.get("feature"), dict)
+                    and (content["feature"].get("name") or content["feature"].get("id"))
+                    and "files" in content
+                    and isinstance(content.get("files"), list)
+                    and len(content["files"]) > 0
+                ):
+                    valid_files.append(json_file)
+        except Exception:
+            continue
+
+    return sorted(valid_files, key=lambda p: p.name)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 async def generate_all_feature_contexts(
     code_map_source: Union[str, Path, dict],
+    force: bool = False,
 ) -> list:
     """
     End-to-end workflow:
-    1. Load and normalise repository-code-map.json
-    2. LLM feature discovery  (fallback: semantic graph-cluster refinement)
-    3. Graph-traversal file selection per feature
-    4. Evidence-based context assembly
-    5. Validation against code-map ground truth
-    6. Save feature-context/*.json
+    1. Check if valid feature-context/*.json files already exist.
+       If they exist and force is False:
+         Return existing contexts from disk without calling Hugging Face LLM.
+    2. Load and normalise repository-code-map.json
+    3. LLM feature discovery  (fallback: semantic graph-cluster refinement)
+    4. Graph-traversal file selection per feature
+    5. Evidence-based context assembly
+    6. Validation against code-map ground truth
+    7. Save feature-context/*.json
     """
+    if not force:
+        existing_files = get_existing_feature_contexts(code_map_source)
+        if existing_files:
+            print(
+                f"[FeatureContext] Found {len(existing_files)} existing valid feature context(s). Skipping LLM generation.",
+                flush=True
+            )
+            backend_logger.info(
+                f"[FeatureContext] Found {len(existing_files)} existing valid feature context(s). Skipping LLM generation."
+            )
+            existing_contexts = []
+            for ef in existing_files:
+                try:
+                    with open(ef, "r", encoding="utf-8") as fh:
+                        existing_contexts.append(json.load(fh))
+                except Exception:
+                    pass
+            if existing_contexts:
+                return existing_contexts
+
     code_map, code_map_path = load_code_map(code_map_source)
     features = await discover_features(code_map)
 

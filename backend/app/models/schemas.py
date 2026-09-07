@@ -124,10 +124,12 @@ class AnalyzeResponse(BaseModel):
 class FeatureContextRequest(BaseModel):
     codeMapPath: Optional[str] = None
     projectId: Optional[str] = None
+    force: Optional[bool] = False
 
 
 class FeatureContextResponse(BaseModel):
     status: str
     featureCount: int
-    savedFiles: list[str]
+    savedFiles: list[str] = []
     message: str = "Feature contexts generated successfully"
+    alreadyExists: bool = False
