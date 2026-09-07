@@ -59,6 +59,7 @@ class ProjectInfo(BaseModel):
     totalFiles: int
     parsedFiles: int
     failedFiles: int
+    codeMapPath: Optional[str] = None
 
 
 class CodeMapPayload(BaseModel):
@@ -66,6 +67,7 @@ class CodeMapPayload(BaseModel):
     files: Union[dict[str, Any], list[Any]]
     relationships: list[dict] = []
     analysis_id: Optional[str] = None
+    codeMapPath: Optional[str] = None
 
     model_config = {'extra': 'allow'}
 
@@ -117,3 +119,15 @@ class AnalyzeResponse(BaseModel):
     projectId: str
     graph: GraphData
     message: str = "Analysis complete"
+
+
+class FeatureContextRequest(BaseModel):
+    codeMapPath: Optional[str] = None
+    projectId: Optional[str] = None
+
+
+class FeatureContextResponse(BaseModel):
+    status: str
+    featureCount: int
+    savedFiles: list[str]
+    message: str = "Feature contexts generated successfully"

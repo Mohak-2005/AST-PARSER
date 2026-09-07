@@ -645,3 +645,7 @@ async def generate_dependency_graph(code_map: dict, analysis_id: str = None) -> 
         analysis_id=analysis_id
     )
     raise ValueError(final_err_msg)
+
+
+# Explicit Hugging Face caller export for project-wide LLM tasks
+execute_hf_llm_call = _execute_openrouter_call

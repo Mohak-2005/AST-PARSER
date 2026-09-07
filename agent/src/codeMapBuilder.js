@@ -413,6 +413,12 @@ function writeCodeMap(codeMap, projectFolderName, config) {
   }
 
   const mapPath = path.join(targetDir, 'repository-code-map.json');
+  if (codeMap && codeMap.project) {
+    codeMap.project.codeMapPath = mapPath;
+  }
+  if (codeMap) {
+    codeMap.codeMapPath = mapPath;
+  }
   fs.writeFileSync(mapPath, JSON.stringify(codeMap, null, 2), 'utf8');
   return mapPath;
 }

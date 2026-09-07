@@ -1,11 +1,20 @@
 import time
 import uuid
 import traceback
+import asyncio
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
-from app.models.schemas import CodeMapPayload, AnalyzeResponse, GraphData
+from app.models.schemas import (
+    CodeMapPayload,
+    AnalyzeResponse,
+    GraphData,
+    FeatureContextRequest,
+    FeatureContextResponse
+)
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
-from app.services.db_repository import save_project, save_graph
+from app.services.db_repository import save_project, save_graph, get_graph
+from app.services.feature_context_generator import generate_all_feature_contexts
 from app.logger import backend_logger, log_stage, log_error
 
 router = APIRouter()
@@ -118,4 +127,58 @@ async def analyze(payload: CodeMapPayload):
         codeMap=code_map_dict
     )
 
+    # Trigger Feature Context Generation if codeMapPath is provided
+    code_map_target = payload.project.codeMapPath or payload.codeMapPath
+    if code_map_target:
+        async def _run_fc():
+            try:
+                await generate_all_feature_contexts(code_map_target)
+            except Exception as fc_err:
+                backend_logger.warn(f"[FeatureContext] Generation task notice: {fc_err}")
+        asyncio.create_task(_run_fc())
+
     return AnalyzeResponse(projectId=project_id, graph=graph, message="Analysis complete")
+
+
+@router.post("/api/feature-context", response_model=FeatureContextResponse)
+async def create_feature_contexts_endpoint(req: FeatureContextRequest):
+    code_map_path = req.codeMapPath
+    code_map_source = code_map_path
+
+    if not code_map_source and req.projectId:
+        graph = await get_graph(req.projectId)
+        if graph and graph.get("codeMap"):
+            cm = graph["codeMap"]
+            cand_path = (
+                cm.get("project", {}).get("codeMapPath")
+                or cm.get("codeMapPath")
+            )
+            if cand_path and Path(cand_path).exists():
+                code_map_source = cand_path
+            else:
+                # If project name exists, check test output folder
+                p_name = graph.get("projectName")
+                if p_name:
+                    fallback_file = Path("C:/Users/Mohak/Desktop/test") / p_name / "repository-code-map.json"
+                    if fallback_file.exists():
+                        code_map_source = str(fallback_file)
+                    else:
+                        code_map_source = cm
+                else:
+                    code_map_source = cm
+
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    try:
+        contexts = await generate_all_feature_contexts(code_map_source)
+        saved_files = [f"{c['feature']['id']}.json" for c in contexts]
+        return FeatureContextResponse(
+            status="success",
+            featureCount=len(contexts),
+            savedFiles=saved_files,
+            message=f"Generated {len(contexts)} feature contexts"
+        )
+    except Exception as exc:
+        backend_logger.error(f"[FeatureContext] Endpoint error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))

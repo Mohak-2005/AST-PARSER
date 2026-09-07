@@ -14,3 +14,11 @@ export const checkAgentHealth = () => agentApi.get('/agent/health');
 export const getGraph = (projectId) => backendApi.get(`/api/graph/${projectId}`);
 export const getProjects = () => backendApi.get('/api/projects');
 export const checkBackendHealth = () => backendApi.get('/api/health');
+
+// Triggers the existing Feature Context Generation service for the current project.
+// Accepts codeMapPath string or object with { codeMapPath, projectId }.
+export const generateFeatureContext = (params) =>
+  backendApi.post(
+    '/api/feature-context',
+    typeof params === 'string' ? { codeMapPath: params } : params
+  );

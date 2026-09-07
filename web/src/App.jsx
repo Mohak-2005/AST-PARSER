@@ -5,8 +5,8 @@ import ProgressPanel from './components/ProgressPanel';
 import GraphView from './components/GraphView';
 import NodeDetails from './components/NodeDetails';
 import EdgeDetails from './components/EdgeDetails';
-import { startAnalysis, getAgentStatus, getGraph } from './api/client';
-import { Layers, PlusCircle } from 'lucide-react';
+import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext } from './api/client';
+import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState('home'); // 'home' | 'analyzing' | 'graph'
@@ -18,6 +18,42 @@ export default function App() {
   const [selectedNode, setSelectedNode] = useState(null);
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [graphLookup, setGraphLookup] = useState(null);
+
+  // Feature Context Generation state — idle | loading | success | error
+  const [featureCtx, setFeatureCtx] = useState({ status: 'idle', message: null, data: null });
+
+  const handleGenerateFeatureContext = async () => {
+    // Prevent duplicate requests
+    if (featureCtx.status === 'loading') return;
+
+    // Read codeMapPath from the already-loaded code map (set by agent's codeMapBuilder.js)
+    const codeMapPath =
+      graphData?.codeMap?.project?.codeMapPath ||
+      graphData?.codeMap?.codeMapPath ||
+      null;
+
+    if (!codeMapPath && !projectId) {
+      setFeatureCtx({
+        status: 'error',
+        message: 'No code map path available for this project. Re-analyze to enable feature context generation.',
+        data: null,
+      });
+      return;
+    }
+
+    setFeatureCtx({ status: 'loading', message: null, data: null });
+    try {
+      const { data } = await generateFeatureContext({ codeMapPath, projectId });
+      setFeatureCtx({ status: 'success', message: data.message, data });
+    } catch (err) {
+      const errMsg =
+        err.response?.data?.detail ||
+        err.response?.data?.error ||
+        err.message ||
+        'Feature context generation failed';
+      setFeatureCtx({ status: 'error', message: errMsg, data: null });
+    }
+  };
 
   const startPolling = useCallback(() => {
     const interval = setInterval(async () => {
@@ -100,6 +136,7 @@ export default function App() {
     setSelectedNode(null);
     setSelectedEdge(null);
     setGraphLookup(null);
+    setFeatureCtx({ status: 'idle', message: null, data: null });
   };
 
   const handleNodeClick = (node, lookup) => {
@@ -131,24 +168,89 @@ export default function App() {
   return (
     <div className="h-screen w-screen flex flex-col bg-slate-900 text-slate-200 overflow-hidden">
       {/* Header */}
-      <header className="h-16 flex-shrink-0 bg-slate-950 border-b border-slate-800 flex items-center justify-between px-6">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center">
-            <Layers className="w-5 h-5 text-white" />
+      <header className="h-auto flex-shrink-0 bg-slate-950 border-b border-slate-800 px-6 py-0">
+        <div className="h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center">
+              <Layers className="w-5 h-5 text-white" />
+            </div>
+            <h1 className="text-lg font-bold text-slate-100 tracking-wide">
+              AST Dependency Analyzer
+            </h1>
           </div>
-          <h1 className="text-lg font-bold text-slate-100 tracking-wide">
-            AST Dependency Analyzer
-          </h1>
+
+          {view === 'graph' && (
+            <div className="flex items-center gap-3">
+              {/* Generate Feature Context button */}
+              <button
+                onClick={handleGenerateFeatureContext}
+                disabled={featureCtx.status === 'loading'}
+                className="flex items-center gap-2 bg-brand-700 hover:bg-brand-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-brand-600"
+                title="Generate feature context files from the current project's code map"
+              >
+                {featureCtx.status === 'loading' ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : featureCtx.status === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4" />
+                ) : featureCtx.status === 'error' ? (
+                  <AlertCircle className="w-4 h-4" />
+                ) : (
+                  <Sparkles className="w-4 h-4" />
+                )}
+                {featureCtx.status === 'loading'
+                  ? 'Generating Feature Context…'
+                  : featureCtx.status === 'success'
+                  ? 'Feature Context Generated'
+                  : 'Generate Feature Context'}
+              </button>
+
+              {/* New Analysis button */}
+              <button
+                onClick={handleNewAnalysis}
+                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-slate-700"
+              >
+                <PlusCircle className="w-4 h-4" />
+                New Analysis
+              </button>
+            </div>
+          )}
         </div>
-        
-        {view === 'graph' && (
-          <button 
-            onClick={handleNewAnalysis}
-            className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-slate-700"
+
+        {/* Feature context status bar — only shown in graph view when there is a message */}
+        {view === 'graph' && featureCtx.status !== 'idle' && (
+          <div
+            className={`text-xs px-2 pb-2 flex items-center gap-2 ${
+              featureCtx.status === 'success'
+                ? 'text-emerald-400'
+                : featureCtx.status === 'error'
+                ? 'text-red-400'
+                : 'text-slate-400'
+            }`}
           >
-            <PlusCircle className="w-4 h-4" />
-            New Analysis
-          </button>
+            {featureCtx.status === 'success' && (
+              <>
+                <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
+                {featureCtx.message}
+                {featureCtx.data?.featureCount != null && (
+                  <span className="ml-1 font-semibold">
+                    ({featureCtx.data.featureCount} feature{featureCtx.data.featureCount !== 1 ? 's' : ''})
+                  </span>
+                )}
+              </>
+            )}
+            {featureCtx.status === 'error' && (
+              <>
+                <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                {featureCtx.message}
+              </>
+            )}
+            {featureCtx.status === 'loading' && (
+              <>
+                <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+                Discovering features and generating context files…
+              </>
+            )}
+          </div>
         )}
       </header>
 
