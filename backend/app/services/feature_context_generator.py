@@ -315,7 +315,8 @@ def _name_candidate(component_files: List[str], code_map: dict) -> Tuple[str, st
     # Signal 2: inherited class names (domain evidence)
     if csig["inherited_classes"]:
         dominant = Counter(csig["inherited_classes"]).most_common(1)[0][0]
-        words = re.sub(r"([A-Z])", r" \1", dominant).replace("_", " ").strip()
+        # Split camelCase only at lowercase→uppercase boundary (keeps "JSON", "API" intact)
+        words = re.sub(r"(?<=[a-z])([A-Z])", r" \1", dominant).replace("_", " ").strip()
         return words.title(), f"Domain implemented around {dominant}."
 
     # Signal 3: deepest common directory prefix
@@ -337,7 +338,8 @@ def _name_candidate(component_files: List[str], code_map: dict) -> Tuple[str, st
         freq = Counter(n.lower() for n in csig["decl_names"])
         best_lower, _ = freq.most_common(1)[0]
         original = next((n for n in csig["decl_names"] if n.lower() == best_lower), best_lower)
-        words = re.sub(r"([A-Z])", r" \1", original).replace("_", " ").strip()
+        # Split camelCase only at lowercase→uppercase boundary
+        words = re.sub(r"(?<=[a-z])([A-Z])", r" \1", original).replace("_", " ").strip()
         return words.title(), f"Functionality implemented across {len(component_files)} file(s)."
 
     return "Core Module", f"Functionality across {len(component_files)} file(s)."
