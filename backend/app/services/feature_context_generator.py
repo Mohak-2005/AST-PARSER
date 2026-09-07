@@ -1,20 +1,44 @@
-import os
+"""
+Feature Context Generator
+=========================
+Consumes repository-code-map.json (produced by the existing Tree-sitter
+analyzer) and generates per-feature context JSON files.
+
+DESIGN CONTRACT
+---------------
+- Reads ONLY from repository-code-map.json.  No file I/O, no Tree-sitter.
+- Language-agnostic:   zero hardcoded language names or extensions.
+- Architecture-agnostic: zero hardcoded folder/framework/pattern names.
+- Graph-driven:  all structural decisions come from the relationships array.
+- Evidence-grounded: all semantic decisions come from declarations, routes,
+  databaseOperations, exports, symbols, and classes fields.
+- Repository-independent: the same code must work for any project whose
+  files and relationships the existing analyzer successfully represents.
+"""
+
 import sys
 import re
 import json
 import asyncio
 from pathlib import Path
-from collections import defaultdict, deque
-from typing import Union, Tuple, List, Dict, Any, Set
+from collections import defaultdict, deque, Counter
+from typing import Union, Tuple, List, Dict, Set, Optional
 
-from app.config import settings
 from app.logger import backend_logger
 from app.services.llm_service import execute_hf_llm_call
 from app.services.json_repair_service import (
     strip_markdown_fences,
     parse_json,
-    repair_json_deterministically
+    repair_json_deterministically,
 )
+
+
+# ---------------------------------------------------------------------------
+# Internal types
+# ---------------------------------------------------------------------------
+
+FilePath = str
+Relevance = str  # "direct" | "dependency"
 
 
 # ---------------------------------------------------------------------------
@@ -22,20 +46,11 @@ from app.services.json_repair_service import (
 # ---------------------------------------------------------------------------
 
 def sanitize_filename(feature_name: str, existing_names: Set[str]) -> str:
-    """
-    Converts a feature name into a clean filesystem-safe filename.
-    Handles special characters, spaces, length, and collision disambiguation.
-    """
-    if not feature_name or not feature_name.strip():
-        base = "feature"
-    else:
-        base = re.sub(r'[^a-zA-Z0-9]+', '-', feature_name.strip().lower())
-        base = re.sub(r'-+', '-', base).strip('-')
-        if not base:
-            base = "feature"
-
+    """Converts a feature name into a collision-safe, filesystem-safe filename."""
+    base = re.sub(r"[^a-zA-Z0-9]+", "-", (feature_name or "").strip().lower())
+    base = re.sub(r"-+", "-", base).strip("-") or "feature"
     if len(base) > 50:
-        base = base[:50].rstrip('-')
+        base = base[:50].rstrip("-")
 
     candidate = f"{base}.json"
     if candidate not in existing_names:
@@ -52,39 +67,37 @@ def sanitize_filename(feature_name: str, existing_names: Set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Code-map loading and normalization
+# Code-map loading and normalisation
 # ---------------------------------------------------------------------------
 
 def load_code_map(code_map_source: Union[str, Path, dict]) -> Tuple[dict, Path]:
     """
-    Loads and standardizes repository-code-map.json.
-    Accepts a filepath, Path object, or already-loaded dictionary.
-    Normalises both legacy (list) and current (dict) `files` formats.
+    Loads and normalises repository-code-map.json.
+
+    Accepts a filepath, Path object, or already-loaded dict.
+    Handles both legacy (list) and current (dict) `files` formats.
     Normalises all path separators to forward slashes.
     """
     print("[FeatureContext] Loading repository-code-map.json", flush=True)
     backend_logger.info("[FeatureContext] Loading repository-code-map.json")
 
-    code_map_path = None
+    code_map_path: Optional[Path] = None
     if isinstance(code_map_source, (str, Path)):
-        resolved_path = Path(code_map_source).resolve()
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"repository-code-map.json not found at: {resolved_path}")
-        code_map_path = resolved_path
-        with open(resolved_path, "r", encoding="utf-8") as fh:
+        resolved = Path(code_map_source).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"repository-code-map.json not found: {resolved}")
+        code_map_path = resolved
+        with open(resolved, "r", encoding="utf-8") as fh:
             code_map = json.load(fh)
     elif isinstance(code_map_source, dict):
         code_map = code_map_source
-        cand = (
-            code_map.get("project", {}).get("codeMapPath")
-            or code_map.get("codeMapPath")
-        )
+        cand = code_map.get("project", {}).get("codeMapPath") or code_map.get("codeMapPath")
         code_map_path = Path(cand).resolve() if cand else Path.cwd() / "repository-code-map.json"
     else:
         raise TypeError(f"Unsupported code_map_source type: {type(code_map_source)}")
 
-    print("[FeatureContext] Loading existing relationships", flush=True)
-    backend_logger.info("[FeatureContext] Loading existing relationships")
+    print("[FeatureContext] Normalising code-map structure", flush=True)
+    backend_logger.info("[FeatureContext] Normalising code-map structure")
 
     # Normalise files → dict keyed by forward-slash relative path
     raw_files = code_map.get("files", {})
@@ -103,7 +116,7 @@ def load_code_map(code_map_source: Union[str, Path, dict]) -> Tuple[dict, Path]:
             files_dict[k.replace("\\", "/")] = v
     code_map["files"] = files_dict
 
-    # Normalise relationships
+    # Normalise relationships — ensure forward-slash paths
     norm_rels = []
     for r in code_map.get("relationships", []):
         frm = (r.get("from") or "").replace("\\", "/")
@@ -119,110 +132,394 @@ def load_code_map(code_map_source: Union[str, Path, dict]) -> Tuple[dict, Path]:
 
 
 # ---------------------------------------------------------------------------
-# Feature discovery — LLM-first, deterministic fallback
+# Shared graph utilities
+# ---------------------------------------------------------------------------
+
+def _build_adjacency(relationships: list, available: Set[str]) -> Tuple[
+    Dict[str, List[Tuple[str, str]]],   # outgoing: src → [(tgt, rel_type)]
+    Dict[str, List[Tuple[str, str]]],   # incoming: tgt → [(src, rel_type)]
+]:
+    """Builds directed adjacency lists for internal (non-external) edges only."""
+    outgoing: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    incoming: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    for r in relationships:
+        frm = r.get("from", "")
+        to = r.get("to", "")
+        rel_type = r.get("type", "imports")
+        if frm in available and to in available and not r.get("external", False):
+            outgoing[frm].append((to, rel_type))
+            incoming[to].append((frm, rel_type))
+    return outgoing, incoming
+
+
+def _bfs_reachable(start: str, adj: Dict[str, List[Tuple[str, str]]],
+                   universe: Set[str]) -> Set[str]:
+    """BFS: returns all nodes reachable from `start` within `universe`."""
+    seen: Set[str] = set()
+    queue: deque = deque([start])
+    while queue:
+        node = queue.popleft()
+        if node in seen:
+            continue
+        seen.add(node)
+        for nb, _ in adj.get(node, []):
+            if nb in universe and nb not in seen:
+                queue.append(nb)
+    return seen
+
+
+def _find_connected_components(relationships: list, available: Set[str]) -> List[List[str]]:
+    """
+    BFS on the undirected projection of the internal relationship graph.
+    Returns a list of connected components (each is a list of file paths).
+    """
+    undirected: Dict[str, Set[str]] = defaultdict(set)
+    for r in relationships:
+        frm, to = r.get("from", ""), r.get("to", "")
+        if frm in available and to in available and not r.get("external", False):
+            undirected[frm].add(to)
+            undirected[to].add(frm)
+
+    visited: Set[str] = set()
+    components: List[List[str]] = []
+    for node in available:
+        if node in visited:
+            continue
+        component: List[str] = []
+        q: deque = deque([node])
+        while q:
+            n = q.popleft()
+            if n in visited:
+                continue
+            visited.add(n)
+            component.append(n)
+            for nb in undirected.get(n, []):
+                if nb not in visited:
+                    q.append(nb)
+        components.append(component)
+
+    components.sort(key=lambda c: (-len(c), c[0]))
+    return components
+
+
+# ---------------------------------------------------------------------------
+# Semantic signals extracted from a file's code-map entry
+# ---------------------------------------------------------------------------
+
+def _file_signals(fdata: dict) -> dict:
+    """
+    Extracts normalised semantic signals from a file's code-map entry.
+    Returns a dict with boolean/list fields — NO language/framework assumptions.
+    All fields may be absent (empty) if the code-map does not provide them.
+    """
+    routes = fdata.get("routes") or fdata.get("apiRoutes") or []
+    db_ops = fdata.get("databaseOperations") or []
+    classes = fdata.get("classes") or []
+    declarations = fdata.get("declarations") or []
+    symbols = fdata.get("symbols") or []
+    exports = fdata.get("exports") or []
+
+    # Route prefix groups (e.g. "/api/users" → "users")
+    route_prefixes: List[str] = []
+    for r in routes:
+        if isinstance(r, dict) and r.get("path"):
+            parts = r["path"].strip("/").split("/")
+            non_empty = [p for p in parts if p and not p.startswith("{") and not p.startswith(":")]
+            if non_empty:
+                route_prefixes.append(non_empty[0])
+
+    # All declaration names (any type the code-map records)
+    decl_names: List[str] = [
+        d["name"] for d in (declarations + symbols + exports + classes)
+        if isinstance(d, dict) and d.get("name") and len(d["name"]) > 1
+    ]
+
+    # Classes with inheritance/implementation evidence
+    inherited_classes = [
+        c["name"] for c in classes
+        if isinstance(c, dict) and c.get("name") and (c.get("extends") or c.get("implements"))
+    ]
+
+    # Export names
+    export_names: Set[str] = {
+        e["name"] for e in exports if isinstance(e, dict) and e.get("name")
+    }
+
+    return {
+        "has_routes": bool(routes),
+        "has_db_ops": bool(db_ops),
+        "has_classes": bool(classes),
+        "has_declarations": bool(declarations or symbols),
+        "has_exports": bool(exports),
+        "route_prefixes": route_prefixes,
+        "decl_names": decl_names,
+        "inherited_classes": inherited_classes,
+        "export_names": export_names,
+        "export_count": len(export_names),
+        "declared_names": {
+            d["name"] for d in (declarations + symbols)
+            if isinstance(d, dict) and d.get("name")
+        },
+    }
+
+
+def _component_signals(component_files: List[str], files_dict: dict) -> dict:
+    """Aggregates semantic signals across all files in a component."""
+    all_route_prefixes: List[str] = []
+    all_decl_names: List[str] = []
+    all_inherited: List[str] = []
+    has_routes = False
+    has_db_ops = False
+
+    for path in component_files:
+        sig = _file_signals(files_dict.get(path, {}))
+        has_routes = has_routes or sig["has_routes"]
+        has_db_ops = has_db_ops or sig["has_db_ops"]
+        all_route_prefixes.extend(sig["route_prefixes"])
+        all_decl_names.extend(sig["decl_names"])
+        all_inherited.extend(sig["inherited_classes"])
+
+    return {
+        "has_routes": has_routes,
+        "has_db_ops": has_db_ops,
+        "route_prefixes": all_route_prefixes,
+        "decl_names": all_decl_names,
+        "inherited_classes": all_inherited,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Candidate naming — multi-signal, evidence-only
+# ---------------------------------------------------------------------------
+
+def _name_candidate(component_files: List[str], code_map: dict) -> Tuple[str, str]:
+    """
+    Derives a human-readable name and description for a feature candidate.
+
+    Signal priority (no framework/folder assumptions):
+    1. Route prefix groups   — strongest API evidence
+    2. Class names with inheritance  — domain model evidence
+    3. Deepest common directory prefix
+    4. Most frequent declaration stem
+    5. Generic fallback
+    """
+    files_dict = code_map.get("files", {})
+    csig = _component_signals(component_files, files_dict)
+
+    # Signal 1: dominant route prefix
+    if csig["route_prefixes"]:
+        dominant = Counter(csig["route_prefixes"]).most_common(1)[0][0]
+        name = dominant.replace("-", " ").replace("_", " ").title()
+        return name, f"Handles routes prefixed by /{dominant}."
+
+    # Signal 2: inherited class names (domain evidence)
+    if csig["inherited_classes"]:
+        dominant = Counter(csig["inherited_classes"]).most_common(1)[0][0]
+        words = re.sub(r"([A-Z])", r" \1", dominant).replace("_", " ").strip()
+        return words.title(), f"Domain implemented around {dominant}."
+
+    # Signal 3: deepest common directory prefix
+    parts_list = [p.split("/") for p in component_files]
+    min_depth = min(len(p) for p in parts_list)
+    common: List[str] = []
+    for depth in range(min_depth - 1):  # exclude filename
+        seg = parts_list[0][depth]
+        if all(p[depth] == seg for p in parts_list) and seg and len(seg) > 1 and not seg.isdigit():
+            common.append(seg)
+        else:
+            break
+    if common:
+        label = common[-1].replace("-", " ").replace("_", " ").title()
+        return f"{label} Module", f"Functionality under {'/'.join(common)}."
+
+    # Signal 4: most frequent declaration stem
+    if csig["decl_names"]:
+        freq = Counter(n.lower() for n in csig["decl_names"])
+        best_lower, _ = freq.most_common(1)[0]
+        original = next((n for n in csig["decl_names"] if n.lower() == best_lower), best_lower)
+        words = re.sub(r"([A-Z])", r" \1", original).replace("_", " ").strip()
+        return words.title(), f"Functionality implemented across {len(component_files)} file(s)."
+
+    return "Core Module", f"Functionality across {len(component_files)} file(s)."
+
+
+# ---------------------------------------------------------------------------
+# Intra-component splitting
+# ---------------------------------------------------------------------------
+
+def _split_component(
+    component_files: List[str],
+    outgoing: Dict[str, List[Tuple[str, str]]],
+    incoming: Dict[str, List[Tuple[str, str]]],
+    files_dict: dict,
+) -> List[Dict]:
+    """
+    Attempts to identify functionally distinct sub-clusters within a single
+    connected component.
+
+    Algorithm:
+    1. Find "source nodes" — files with in-degree 0 within the component.
+       These are natural candidate entry points for distinct features.
+    2. If multiple unconnected sources exist, compute the sub-graph reachable
+       from each source.
+    3. Measure overlap between sub-graphs.
+       - High overlap (≥ 50%) → sources are likely part of the same feature.
+       - Low overlap           → sources likely anchor distinct features.
+    4. Assign each non-source file to its exclusive owner(s), or mark as shared.
+
+    Returns a list of {"files": [...], "seeds": [...]} dicts.
+    """
+    if len(component_files) <= 2:
+        return [{"files": component_files, "seeds": component_files[:1]}]
+
+    file_set = set(component_files)
+
+    # In-degree within this component only
+    local_in: Dict[str, int] = {f: 0 for f in component_files}
+    for f in component_files:
+        for nb, _ in outgoing.get(f, []):
+            if nb in file_set:
+                local_in[nb] = local_in.get(nb, 0) + 1
+
+    sources = [f for f in component_files if local_in.get(f, 0) == 0]
+
+    # If 0 or 1 source (or a cycle covering everything), treat as one feature
+    if len(sources) <= 1:
+        seed = sources[0] if sources else component_files[0]
+        return [{"files": component_files, "seeds": [seed]}]
+
+    # Check whether sources are directly connected to each other
+    source_set = set(sources)
+    cross = sum(
+        1 for src in sources
+        for nb, _ in outgoing.get(src, [])
+        if nb in source_set
+    )
+    if cross > 0:
+        return [{"files": component_files, "seeds": sources[:2]}]
+
+    # Compute reachable sub-graph from each source (within component)
+    sub_graphs: Dict[str, Set[str]] = {}
+    for src in sources:
+        sub_graphs[src] = _bfs_reachable(src, outgoing, file_set)
+
+    # Measure overall overlap
+    union_size = len(set().union(*sub_graphs.values()))
+    if len(sources) >= 2:
+        intersection = sub_graphs[sources[0]].copy()
+        for s in sources[1:]:
+            intersection &= sub_graphs[s]
+        overlap_ratio = len(intersection) / max(union_size, 1)
+        if overlap_ratio > 0.5:
+            # More than half the component is shared → single feature
+            return [{"files": component_files, "seeds": sources[:2]}]
+
+    # Assign files to source groups
+    groups: Dict[str, Set[str]] = {src: set() for src in sources}
+    shared: Set[str] = set()
+
+    for f in component_files:
+        owners = [src for src in sources if f in sub_graphs[src]]
+        if len(owners) == 1:
+            groups[owners[0]].add(f)
+        elif len(owners) > 1:
+            shared.add(f)
+
+    # Shared files go into every group that owns them
+    for src in sources:
+        groups[src].update(shared)
+
+    # Deduplicate groups (identical sets → merge)
+    seen_frozen: Set[frozenset] = set()
+    result: List[Dict] = []
+    for src in sources:
+        fs = frozenset(groups[src] or {src})
+        if fs not in seen_frozen:
+            seen_frozen.add(fs)
+            result.append({"files": list(fs), "seeds": [src]})
+
+    return result or [{"files": component_files, "seeds": sources[:1]}]
+
+
+# ---------------------------------------------------------------------------
+# Feature Discovery — LLM-first, semantically-refined deterministic fallback
 # ---------------------------------------------------------------------------
 
 def _build_file_summary(rel_path: str, file_data: dict) -> dict:
-    """
-    Extracts a concise, architecture-agnostic evidence summary for a single file.
-    Reads only what the existing code-map provides; never invents structure.
-    """
+    """Compact evidence summary of one file for the LLM prompt."""
+    sig = _file_signals(file_data)
     lang = file_data.get("language") or file_data.get("file", {}).get("language", "")
-
-    # Declarations — include ALL types the analyzer produces
-    decl_names = []
-    for item in (
-        file_data.get("declarations", [])
-        + file_data.get("classes", [])
-        + file_data.get("symbols", [])
-        + file_data.get("exports", [])
-    ):
-        if isinstance(item, dict) and item.get("name"):
-            dtype = item.get("type", "symbol")
-            decl_names.append(f"{dtype} {item['name']}")
-
-    # API routes — only when the code-map actually provides them
-    routes = []
-    for r in (file_data.get("routes") or file_data.get("apiRoutes") or []):
-        if isinstance(r, dict) and r.get("path"):
-            routes.append(f"{r.get('method', '').upper()} {r['path']}".strip())
-
-    # Database operations — only when present
-    db_ops = []
-    for op in (file_data.get("databaseOperations") or []):
-        if isinstance(op, dict):
-            name = op.get("operation") or op.get("callee")
-            if name:
-                db_ops.append(name)
-
-    # Internal imports from code-map dependencies
-    internal_imports = []
-    for dep in (file_data.get("dependencies") or []):
-        if isinstance(dep, dict) and dep.get("type") == "internal":
-            t = dep.get("target")
-            if t:
-                internal_imports.append(t)
-
     summary: dict = {"path": rel_path, "language": lang}
-    if decl_names:
-        summary["declarations"] = decl_names[:15]
-    if routes:
-        summary["routes"] = routes[:10]
-    if db_ops:
-        summary["databaseOperations"] = list(set(db_ops))[:5]
-    if internal_imports:
-        summary["internalImports"] = internal_imports[:10]
+    if sig["decl_names"]:
+        summary["declarations"] = sig["decl_names"][:15]
+    if sig["has_routes"]:
+        routes = file_data.get("routes") or file_data.get("apiRoutes") or []
+        summary["routes"] = [
+            f"{r.get('method', '').upper()} {r['path']}"
+            for r in routes[:10]
+            if isinstance(r, dict) and r.get("path")
+        ]
+    if sig["has_db_ops"]:
+        db_ops = file_data.get("databaseOperations") or []
+        summary["databaseOperations"] = list({
+            op.get("operation") or op.get("callee")
+            for op in db_ops if isinstance(op, dict)
+            if op.get("operation") or op.get("callee")
+        })[:5]
+    deps = file_data.get("dependencies") or []
+    internal = [d.get("target") for d in deps if isinstance(d, dict) and d.get("type") == "internal"]
+    if internal:
+        summary["internalImports"] = internal[:10]
     return summary
 
 
 def build_feature_discovery_prompt(code_map: dict) -> list:
     """
     Builds the HF LLM messages for feature discovery.
-    The prompt is deliberately architecture-neutral; it describes only what
-    the code-map actually contains.
+    Deliberately architecture-neutral; describes only what the code-map provides.
     """
     project_info = code_map.get("project", {})
     project_name = project_info.get("name", "Project")
     languages = project_info.get("languagesDetected", [])
     files = code_map.get("files", {})
 
-    file_summaries = [
-        _build_file_summary(rel, fdata)
-        for rel, fdata in files.items()
-    ]
+    file_summaries = [_build_file_summary(p, d) for p, d in files.items()]
 
     system_content = (
-        "You are an expert software analyst. You will be given a structured code map "
-        "of a software repository. Your task is to identify distinct, meaningful "
-        "FEATURES of this codebase based ONLY on the actual evidence in the code map.\n\n"
-        "RULES:\n"
-        "1. Derive features ONLY from the code map facts. Do NOT invent or assume features "
-        "that are not supported by the evidence.\n"
-        "2. A feature is any coherent unit of behaviour: a data-processing pipeline, "
-        "a user-facing capability, a protocol handler, a CLI command, a background job, "
-        "a library API surface, or any other logical grouping — whatever fits THIS repository.\n"
-        "3. Do NOT assume any particular architecture (e.g. MVC, REST, client-server). "
-        "Identify features that exist in the code, not in a template.\n"
-        "4. Every feature must list 1–5 'seedFiles': the primary files that directly "
-        "implement or anchor that feature.\n"
-        "5. Feature count is dynamic: discover as many or as few as the code map supports.\n"
-        "6. Return ONLY a valid JSON object. No markdown, no explanation."
+        "You are an expert software analyst. You will receive a structured code map "
+        "of a software repository and must identify its meaningful FEATURES.\n\n"
+        "RULES — read carefully:\n"
+        "1. Derive features ONLY from the code-map evidence. Do NOT invent features "
+        "that are not supported by declarations, relationships, routes, or operations.\n"
+        "2. A feature is any coherent unit of behaviour in THIS specific repository: "
+        "it could be a data-processing pipeline, a user capability, a protocol handler, "
+        "a CLI command, a library API surface, a background job, or anything else — "
+        "whatever the code-map evidence actually shows.\n"
+        "3. Do NOT assume any architecture (MVC, REST, microservices, client-server, etc.). "
+        "Identify features as they exist in the code.\n"
+        "4. Connected-component grouping is only a starting hint. A large connected "
+        "component may contain multiple distinct features; several small components may "
+        "form one feature. Use declarations, relationship directions, route groupings, "
+        "and database operations to decide.\n"
+        "5. Each feature must list 1–5 'seedFiles': the primary files that directly "
+        "implement or anchor the feature core.\n"
+        "6. Feature count and names are determined by the code-map, not by templates.\n"
+        "7. Return ONLY valid JSON. No markdown, no prose."
     )
 
     user_content = (
-        f"Project Name: {project_name}\n"
+        f"Project: {project_name}\n"
         f"Languages: {', '.join(languages) if languages else 'unknown'}\n"
-        f"Total Source Files: {len(file_summaries)}\n\n"
-        f"Repository Code Map Summary:\n"
-        f"{json.dumps(file_summaries, indent=2)}\n\n"
-        "Identify the features of this codebase. Return ONLY valid JSON:\n"
+        f"Files: {len(file_summaries)}\n\n"
+        f"Code Map Summary:\n{json.dumps(file_summaries, indent=2)}\n\n"
+        "Return ONLY this JSON structure:\n"
         "{\n"
         '  "features": [\n'
         "    {\n"
         '      "id": "feature-unique-slug",\n'
-        '      "name": "Human Readable Feature Name",\n'
+        '      "name": "Human Readable Name",\n'
         '      "description": "What this feature does in this specific codebase.",\n'
-        '      "seedFiles": ["relative/path/to/primary/file"]\n'
+        '      "seedFiles": ["relative/path/to/file"]\n'
         "    }\n"
         "  ]\n"
         "}"
@@ -230,24 +527,23 @@ def build_feature_discovery_prompt(code_map: dict) -> list:
 
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
+        {"role": "user", "content": user_content},
     ]
 
 
 async def discover_features(code_map: dict) -> list:
     """
-    Discovers application features using the existing Hugging Face LLM integration.
-    Falls back to deterministic graph-clustering if LLM is unavailable.
+    Discovers features via Hugging Face LLM with a semantic-refinement fallback.
     """
     print("[FeatureContext] Starting feature discovery", flush=True)
     backend_logger.info("[FeatureContext] Starting feature discovery")
 
     messages = build_feature_discovery_prompt(code_map)
-    raw_content, status_code, _ = await execute_hf_llm_call(
+    raw_content, _, _ = await execute_hf_llm_call(
         messages=messages,
         max_tokens=4000,
         temperature=0.1,
-        stage_name="FEATURE_DISCOVERY"
+        stage_name="FEATURE_DISCOVERY",
     )
 
     cleaned = strip_markdown_fences(raw_content)
@@ -259,10 +555,10 @@ async def discover_features(code_map: dict) -> list:
             parsed_json = rep_data
         else:
             backend_logger.warning(
-                "[FeatureContext] LLM feature discovery returned invalid structure; "
-                "falling back to graph-cluster discovery"
+                "[FeatureContext] LLM discovery returned invalid structure; "
+                "using deterministic semantic-refinement fallback"
             )
-            parsed_json = {"features": fallback_feature_discovery(code_map)}
+            return fallback_feature_discovery(code_map)
 
     features = parsed_json.get("features", [])
     available_files = set(code_map.get("files", {}).keys())
@@ -283,12 +579,11 @@ async def discover_features(code_map: dict) -> list:
             if isinstance(s, str)
         ]
 
-        # Keep only seeds that actually exist in the code map
         confirmed_seeds = [f for f in seed_files if f in available_files]
 
-        # If none confirmed, try keyword match against file paths
+        # Keyword fallback for unresolved seeds
         if not confirmed_seeds:
-            slug = re.sub(r'[^a-zA-Z0-9]+', ' ', feat_name.lower())
+            slug = re.sub(r"[^a-zA-Z0-9]+", " ", feat_name.lower())
             keywords = [w for w in slug.split() if len(w) > 3]
             for f in available_files:
                 if any(kw in f.lower() for kw in keywords):
@@ -303,11 +598,11 @@ async def discover_features(code_map: dict) -> list:
             "id": feat_id,
             "name": feat_name,
             "description": feat_desc,
-            "seedFiles": confirmed_seeds
+            "seedFiles": confirmed_seeds,
         })
 
     if not valid_features:
-        valid_features = fallback_feature_discovery(code_map)
+        return fallback_feature_discovery(code_map)
 
     print(f"[FeatureContext] Discovered {len(valid_features)} features", flush=True)
     backend_logger.info(f"[FeatureContext] Discovered {len(valid_features)} features")
@@ -316,161 +611,98 @@ async def discover_features(code_map: dict) -> list:
 
 def fallback_feature_discovery(code_map: dict) -> list:
     """
-    Fully graph-driven deterministic fallback.
-    Groups files by connected components in the dependency graph, then
-    names each group from its dominant declarations or the deepest common
-    directory prefix.
+    Deterministic fallback with two-phase approach:
 
-    This approach is architecture-agnostic:
-    - Works for monorepos, microservices, CLI tools, libraries, etc.
-    - Makes zero assumptions about folder names or language-specific patterns.
+    Phase 1 — CANDIDATE GENERATION
+      Build connected components of the internal relationship graph.
+      Each component is a candidate, NOT a guaranteed final feature.
+
+    Phase 2 — SEMANTIC REFINEMENT
+      For each candidate:
+        a. Analyse multi-signal evidence (routes, db ops, classes, declarations,
+           relationship direction).
+        b. Split if multiple independent source-node sub-graphs exist with
+           low overlap (< 50% shared files) — these likely anchor distinct features.
+        c. Keep as one feature if sources are connected or overlap is high.
+      Name each refined candidate from its strongest evidence signal.
+
+    NO architecture, language, or folder-naming assumptions.
     """
-    files = code_map.get("files", {})
+    files_dict = code_map.get("files", {})
     relationships = code_map.get("relationships", [])
-    available = set(files.keys())
+    available = set(files_dict.keys())
 
-    # Build undirected adjacency for connected-component clustering
-    adj: Dict[str, Set[str]] = defaultdict(set)
-    for r in relationships:
-        frm = r.get("from", "")
-        to = r.get("to", "")
-        if frm in available and to in available and not r.get("external", False):
-            adj[frm].add(to)
-            adj[to].add(frm)
+    if not available:
+        return [{"id": "feature-1", "name": "Empty Repository",
+                 "description": "No files found.", "seedFiles": []}]
 
-    visited: Set[str] = set()
-    components: List[List[str]] = []
+    outgoing, incoming = _build_adjacency(relationships, available)
+    components = _find_connected_components(relationships, available)
 
-    for f in available:
-        if f in visited:
-            continue
-        # BFS
-        component = []
-        queue = deque([f])
-        while queue:
-            node = queue.popleft()
-            if node in visited:
-                continue
-            visited.add(node)
-            component.append(node)
-            for neighbour in adj.get(node, []):
-                if neighbour not in visited:
-                    queue.append(neighbour)
-        components.append(component)
+    # Phase 2: refine each component into ≥1 feature candidates
+    feature_candidates: List[Dict] = []
+    for component in components:
+        sub_clusters = _split_component(component, outgoing, incoming, files_dict)
+        for cluster in sub_clusters:
+            feature_candidates.append(cluster)
 
-    # Sort: largest components first, then alphabetically
-    components.sort(key=lambda c: (-len(c), c[0]))
-
+    # Generate named features from each candidate
     features = []
-    for idx, component in enumerate(components):
-        # Derive a human-readable name from shared directory prefix or top declarations
-        name = _component_name(component, files)
+    for idx, candidate in enumerate(feature_candidates):
+        cluster_files = candidate["files"]
+        seeds = candidate["seeds"]
+        name, description = _name_candidate(cluster_files, code_map)
         features.append({
             "id": f"feature-{idx + 1}",
             "name": name,
-            "description": f"Functionality implemented across {len(component)} file(s).",
-            "seedFiles": component[:4]
+            "description": description,
+            "seedFiles": seeds[:4],
         })
 
-    return features or [{"id": "feature-1", "name": "Core Module",
-                         "description": "All project files.", "seedFiles": list(available)[:4]}]
+    if not features:
+        return [{
+            "id": "feature-1",
+            "name": "Core Module",
+            "description": "All project files.",
+            "seedFiles": list(available)[:4],
+        }]
 
-
-def _component_name(component: List[str], files_dict: dict) -> str:
-    """
-    Derives a short, human-readable name for a connected component.
-    Checks (in order):
-      1. Dominant declaration names (class/function/component/export)
-      2. Deepest common directory prefix
-      3. First file path segment that is not a single-letter or numeric-only segment
-    """
-    # Collect all top-level declaration names across the component
-    decl_names: List[str] = []
-    for path in component:
-        fdata = files_dict.get(path, {})
-        for item in (
-            fdata.get("declarations", [])
-            + fdata.get("classes", [])
-            + fdata.get("exports", [])
-            + fdata.get("symbols", [])
-        ):
-            if isinstance(item, dict) and item.get("name"):
-                n = item["name"].strip()
-                if n and len(n) > 2:
-                    decl_names.append(n)
-
-    if decl_names:
-        # Pick the most frequently seen name stem
-        from collections import Counter
-        # Normalise to lower for frequency, but keep original casing
-        freq = Counter(n.lower() for n in decl_names)
-        best_lower = freq.most_common(1)[0][0]
-        original = next((n for n in decl_names if n.lower() == best_lower), best_lower)
-        # Convert CamelCase / snake_case to Title Words
-        words = re.sub(r'([A-Z])', r' \1', original).replace('_', ' ').strip()
-        return words.title()
-
-    # Fall back to deepest common directory prefix
-    parts_list = [p.split("/") for p in component]
-    min_depth = min(len(p) for p in parts_list)
-    common: List[str] = []
-    for depth in range(min_depth - 1):  # exclude filename
-        segment = parts_list[0][depth]
-        if all(p[depth] == segment for p in parts_list):
-            if segment and len(segment) > 1 and not segment.isdigit():
-                common.append(segment)
-        else:
-            break
-
-    if common:
-        return common[-1].replace("-", " ").replace("_", " ").title() + " Module"
-
-    # Last resort: first meaningful path segment of the first file
-    for part in component[0].split("/"):
-        if part and len(part) > 1 and not part.isdigit():
-            return part.replace("-", " ").replace("_", " ").title() + " Module"
-
-    return "Core Module"
+    print(f"[FeatureContext] Fallback discovered {len(features)} feature candidate(s)", flush=True)
+    backend_logger.info(f"[FeatureContext] Fallback discovered {len(features)} feature candidate(s)")
+    return features
 
 
 # ---------------------------------------------------------------------------
 # Graph-traversal file selection
 # ---------------------------------------------------------------------------
 
-def select_feature_files(feature: dict, code_map: dict, max_depth: int = 2) -> list:
+def select_feature_files(
+    feature: dict,
+    code_map: dict,
+    max_depth: int = 2,
+) -> list:
     """
-    Traverses the pre-computed dependency graph starting from the feature's seed files.
+    Selects files relevant to a feature by graph traversal.
 
     Strategy (architecture-agnostic):
-    - BFS outgoing edges up to max_depth: what the seeds import/call/use
-    - Add direct callers of seeds (depth-1 incoming) without expanding their children
-      → prevents sibling features from polluting the context
+    - BFS along outgoing edges from seed files up to max_depth.
+    - Add direct callers (depth-1 incoming) of seeds without expanding
+      their other outgoing children — prevents sibling features polluting context.
 
     Assigns relevance: "direct" for seeds, "dependency" for reachable nodes.
-    Role is determined by evidence in the code-map (see determine_file_role).
     """
     feat_name = feature.get("name", "Unknown")
-    print(f"[FeatureContext] Building context for feature: {feat_name}", flush=True)
-    backend_logger.info(f"[FeatureContext] Building context for feature: {feat_name}")
+    print(f"[FeatureContext] Selecting files for: {feat_name}", flush=True)
+    backend_logger.info(f"[FeatureContext] Selecting files for: {feat_name}")
 
     files_dict = code_map.get("files", {})
     relationships = code_map.get("relationships", [])
+    available = set(files_dict.keys())
 
-    # Build adjacency lists (internal edges only)
-    outgoing: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-    incoming: Dict[str, List[str]] = defaultdict(list)
-
-    for r in relationships:
-        src = r.get("from", "")
-        tgt = r.get("to", "")
-        is_ext = r.get("external", False)
-        rel_type = r.get("type", "imports")
-        if src and tgt and not is_ext:
-            outgoing[src].append((tgt, rel_type))
-            incoming[tgt].append(src)
+    outgoing, incoming = _build_adjacency(relationships, available)
 
     seed_files = set(feature.get("seedFiles", []))
-    selected: Dict[str, str] = {}  # path → relevance
+    selected: Dict[str, Relevance] = {}
 
     for s in seed_files:
         if s in files_dict:
@@ -492,77 +724,68 @@ def select_feature_files(feature: dict, code_map: dict, max_depth: int = 2) -> l
 
     # Add direct callers of seeds (no expansion)
     for s in seed_files:
-        for src in incoming.get(s, []):
+        for src, _ in incoming.get(s, []):
             if src in files_dict and src not in selected:
                 selected[src] = "dependency"
 
-    result_files = []
+    result = []
     for path, relevance in selected.items():
         fdata = files_dict.get(path, {})
-        role = determine_file_role(path, fdata, relationships)
-        result_files.append({"path": path, "role": role, "relevance": relevance})
+        role = determine_file_role(path, fdata)
+        result.append({"path": path, "role": role, "relevance": relevance})
 
-    print(f"[FeatureContext] Selected {len(result_files)} relevant files", flush=True)
-    backend_logger.info(f"[FeatureContext] Selected {len(result_files)} relevant files")
-    return result_files
+    print(f"[FeatureContext] Selected {len(result)} file(s)", flush=True)
+    backend_logger.info(f"[FeatureContext] Selected {len(result)} file(s)")
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Evidence-based role classification — architecture/language-agnostic
+# Evidence-based role classification — no path-name or language assumptions
 # ---------------------------------------------------------------------------
 
-def determine_file_role(path: str, file_data: dict, relationships: list = None) -> str:
+def determine_file_role(path: str, file_data: dict) -> str:
     """
-    Classifies a file's architectural role from CODE-MAP EVIDENCE ONLY.
+    Classifies a file's architectural role using CODE-MAP EVIDENCE ONLY.
 
-    Priority order (highest to lowest):
-    1. Has API routes declared            → "API Route Handler"
-    2. Has database operations declared   → "Data Layer"
-    3. Has only/mostly export declarations → "Library / Module API"
-    4. Has class declarations with inheritance/implementation → "Domain Model"
-    5. Is imported by many others (hub)   → "Shared Utility"
-    6. Has no outgoing internal deps (leaf) + declarations → "Implementation Module"
-    7. Entry point signals (main, index, __init__, cmd, cli, main.go, etc.)
-    8. Default                            → "Source Module"
+    Evidence is evaluated in this order. The FIRST matching evidence wins;
+    no heuristic overrides a higher-priority positive evidence signal.
 
-    NOTE: Does NOT use path name keywords like 'service', 'controller', 'component'
-    because those are framework conventions, NOT universal facts.
+    1. Has API routes declared           → "API Route Handler"
+    2. Has database operations declared  → "Data Layer"
+    3. Has class with extends/implements → "Domain Model"
+    4. All declared names exported (≥3)  → "Library / Module API"
+    5. Filename matches universal entry-point conventions → "Entry Point"
+    6. Has any declarations or classes   → "Implementation Module"
+    7. (default)                         → "Source Module"
+
+    NOTE:
+    - Path names (folder, extension) are NOT used — they are conventions,
+      not universal facts.
+    - Relationship in-degree is NOT used — connectivity is structural,
+      not semantic. A widely-imported file can be any role.
+    - Language is NOT used as a trigger — it is metadata only.
     """
-    if relationships is None:
-        relationships = []
+    sig = _file_signals(file_data)
 
-    # Evidence 1: API routes
-    raw_routes = file_data.get("routes") or file_data.get("apiRoutes") or []
-    if raw_routes:
+    # 1. API routes
+    if sig["has_routes"]:
         return "API Route Handler"
 
-    # Evidence 2: Database operations
-    if file_data.get("databaseOperations"):
+    # 2. Database operations
+    if sig["has_db_ops"]:
         return "Data Layer"
 
-    # Evidence 3: Class declarations with inheritance/interface information
-    classes = file_data.get("classes", [])
-    has_class_with_inheritance = any(
-        isinstance(c, dict) and (c.get("extends") or c.get("implements"))
-        for c in classes
-    )
-    if has_class_with_inheritance:
+    # 3. Class with inheritance / interface implementation
+    if sig["inherited_classes"]:
         return "Domain Model"
 
-    # Evidence 4: All-exports file (library surface)
-    exports = file_data.get("exports", [])
-    declarations = file_data.get("declarations", [])
-    symbols = file_data.get("symbols", [])
-    all_decls = declarations + symbols
-
-    export_names = {e.get("name") for e in exports if isinstance(e, dict) and e.get("name")}
-    decl_names = {d.get("name") for d in all_decls if isinstance(d, dict) and d.get("name")}
-    if export_names and decl_names and export_names.issuperset(decl_names) and len(export_names) >= 2:
+    # 4. Library / Module API surface
+    # Conservative: requires ≥3 exports AND every declared name is exported
+    if sig["export_count"] >= 3 and sig["declared_names"] and sig["export_names"].issuperset(sig["declared_names"]):
         return "Library / Module API"
 
-    # Evidence 5: Entry point by filename convention (language-agnostic common patterns)
-    filename = path.rsplit("/", 1)[-1].lower()
-    entry_point_names = {
+    # 5. Entry-point filename (universal cross-language conventions only)
+    _ENTRY_POINT_NAMES = {
         "main.py", "main.go", "main.rs", "main.c", "main.cpp", "main.java",
         "main.ts", "main.js", "main.rb", "main.cs", "main.kt", "main.swift",
         "index.js", "index.ts", "index.py",
@@ -570,24 +793,17 @@ def determine_file_role(path: str, file_data: dict, relationships: list = None) 
         "app.js", "app.ts", "app.py",
         "server.js", "server.ts",
         "cmd.go", "cli.go", "cli.py",
-        "manage.py",  # Django
+        "manage.py",
     }
-    if filename in entry_point_names:
+    filename = path.rsplit("/", 1)[-1].lower()
+    if filename in _ENTRY_POINT_NAMES:
         return "Entry Point"
 
-    # Evidence 6: High in-degree (many files import this one) → shared utility
-    if relationships:
-        in_degree = sum(
-            1 for r in relationships
-            if r.get("to") == path and not r.get("external", False)
-        )
-        if in_degree >= 4:
-            return "Shared Utility"
-
-    # Evidence 7: Has declarations → some form of implementation module
-    if all_decls or classes:
+    # 6. Has declarations or classes → some form of implementation module
+    if sig["has_declarations"] or sig["has_classes"]:
         return "Implementation Module"
 
+    # 7. Default
     return "Source Module"
 
 
@@ -598,38 +814,39 @@ def determine_file_role(path: str, file_data: dict, relationships: list = None) 
 async def generate_feature_context(
     feature: dict,
     selected_files: list,
-    code_map: dict
+    code_map: dict,
 ) -> dict:
     """
     Assembles the Feature Context object.
 
-    Schema:
+    Output schema:
     {
-      "feature": { "id", "name", "description" },
+      "feature":       { "id", "name", "description" },
       "files": [
         {
           "path", "role", "relevance", "language",
-          "declarations"?,      ← from code-map, all types
-          "routes"?,            ← when present in code-map
-          "databaseOperations"?,← when present in code-map
+          "declarations"?,       ← from code-map (all types present)
+          "routes"?,             ← when code-map provides routes
+          "databaseOperations"?, ← when code-map provides db ops
           "dependencies": [{ "target", "type", "kind", "line"? }]
         }
       ],
       "relationships": [{ "from", "to", "type", "evidence"? }],
-      "featureFlow": ["Step 1: ...", ...],
+      "featureFlow":   ["Step 1: ...", ...],
       "sharedDependencies": ["external-pkg", ...]
     }
 
-    All fields are derived from the repository-code-map. Nothing is invented.
+    Every field is sourced from repository-code-map.json.
+    Nothing is invented.
     """
-    print("[FeatureContext] Generating feature context", flush=True)
-    backend_logger.info("[FeatureContext] Generating feature context")
+    print(f"[FeatureContext] Assembling context for: {feature.get('name')}", flush=True)
+    backend_logger.info(f"[FeatureContext] Assembling context for: {feature.get('name')}")
 
     files_dict = code_map.get("files", {})
     selected_paths = {f["path"] for f in selected_files}
     shared_deps: Set[str] = set()
 
-    # Pre-index file-level dependency list from the relationship graph
+    # Build per-file dependency list from the relationship graph
     file_deps_map: Dict[str, list] = defaultdict(list)
     for r in code_map.get("relationships", []):
         src = r.get("from", "")
@@ -640,12 +857,11 @@ async def generate_feature_context(
         dep_entry: dict = {
             "target": tgt,
             "type": "external" if is_ext else "internal",
-            "kind": r.get("type", "imports")
+            "kind": r.get("type", "imports"),
         }
-        evidence = r.get("evidence", {})
-        if isinstance(evidence, dict) and evidence.get("line"):
-            dep_entry["line"] = evidence["line"]
-
+        ev = r.get("evidence", {})
+        if isinstance(ev, dict) and ev.get("line"):
+            dep_entry["line"] = ev["line"]
         if is_ext:
             shared_deps.add(tgt)
             file_deps_map[src].append(dep_entry)
@@ -653,7 +869,6 @@ async def generate_feature_context(
             file_deps_map[src].append(dep_entry)
 
     enriched_files = []
-    all_routes = []  # collected for featureFlow context
 
     for f in selected_files:
         p = f["path"]
@@ -664,16 +879,16 @@ async def generate_feature_context(
             "path": p,
             "role": f.get("role", "Source Module"),
             "relevance": f.get("relevance", "dependency"),
-            "language": lang
+            "language": lang,
         }
 
-        # Declarations — all types the analyzer produced
+        # All declarations the code-map recorded (any type)
         file_decls = []
-        seen_decl_names: Set[str] = set()
+        seen: Set[str] = set()
 
-        for c in fdata.get("classes", []):
-            if isinstance(c, dict) and c.get("name") and c["name"] not in seen_decl_names:
-                seen_decl_names.add(c["name"])
+        for c in (fdata.get("classes") or []):
+            if isinstance(c, dict) and c.get("name") and c["name"] not in seen:
+                seen.add(c["name"])
                 entry: dict = {"name": c["name"], "type": "class"}
                 if c.get("extends"):
                     entry["extends"] = c["extends"]
@@ -684,38 +899,32 @@ async def generate_feature_context(
                 file_decls.append(entry)
 
         for item in (
-            fdata.get("declarations", [])
-            + fdata.get("symbols", [])
-            + fdata.get("exports", [])
+            (fdata.get("declarations") or [])
+            + (fdata.get("symbols") or [])
+            + (fdata.get("exports") or [])
         ):
-            if isinstance(item, dict) and item.get("name"):
-                name = item["name"]
-                if name not in seen_decl_names:
-                    seen_decl_names.add(name)
-                    file_decls.append({
-                        "name": name,
-                        "type": item.get("type", "symbol")
-                    })
+            if isinstance(item, dict) and item.get("name") and item["name"] not in seen:
+                seen.add(item["name"])
+                file_decls.append({"name": item["name"], "type": item.get("type", "symbol")})
 
         if file_decls:
             file_entry["declarations"] = file_decls
 
-        # Routes — only when code-map provides them (no assumptions)
+        # Routes — only when the code-map provides them
         file_routes = []
         for r in (fdata.get("routes") or fdata.get("apiRoutes") or []):
             if isinstance(r, dict) and r.get("path"):
                 r_entry: dict = {
-                    "method": r.get("method", "").upper() or "UNKNOWN",
-                    "path": r["path"]
+                    "method": (r.get("method") or "").upper() or "UNKNOWN",
+                    "path": r["path"],
                 }
                 if r.get("line"):
                     r_entry["line"] = r["line"]
                 file_routes.append(r_entry)
-                all_routes.append({**r_entry, "file": p})
         if file_routes:
             file_entry["routes"] = file_routes
 
-        # Database operations — only when code-map provides them
+        # Database operations — only when the code-map provides them
         file_db_ops = []
         for op in (fdata.get("databaseOperations") or []):
             if isinstance(op, dict):
@@ -728,42 +937,36 @@ async def generate_feature_context(
         if file_db_ops:
             file_entry["databaseOperations"] = file_db_ops
 
-        # Per-file dependency list (internal + external)
         deps = file_deps_map.get(p, [])
         if deps:
             file_entry["dependencies"] = deps
 
         enriched_files.append(file_entry)
 
-    # Top-level inter-file relationships (both ends inside selected set)
+    # Top-level inter-file relationships (both ends in selected set, sourced from graph)
     inter_file_rels = []
     for r in code_map.get("relationships", []):
         src = r.get("from", "")
         tgt = r.get("to", "")
         if src in selected_paths and tgt in selected_paths and not r.get("external", False):
-            rel_entry: dict = {
-                "from": src,
-                "to": tgt,
-                "type": r.get("type", "imports")
-            }
+            rel_entry: dict = {"from": src, "to": tgt, "type": r.get("type", "imports")}
             ev = r.get("evidence")
             if ev:
                 rel_entry["evidence"] = ev
             inter_file_rels.append(rel_entry)
 
-    # LLM-generated feature flow (with graph-grounded deterministic fallback)
     feature_flow = await generate_feature_flow(feature, enriched_files, inter_file_rels)
 
     return {
         "feature": {
             "id": feature.get("id"),
             "name": feature.get("name"),
-            "description": feature.get("description")
+            "description": feature.get("description"),
         },
         "files": enriched_files,
         "relationships": inter_file_rels,
         "featureFlow": feature_flow,
-        "sharedDependencies": sorted(shared_deps)
+        "sharedDependencies": sorted(shared_deps),
     }
 
 
@@ -774,48 +977,60 @@ async def generate_feature_context(
 async def generate_feature_flow(
     feature: dict,
     enriched_files: list,
-    relationships: list
+    relationships: list,
 ) -> list:
     """
-    Generates a concise execution/data-flow description for this feature.
-    Uses HF LLM grounded in the file list and relationship graph.
-    Falls back to a topology-sorted walk through the relationship graph.
+    Describes how execution or data flows through this feature.
+
+    LLM-first: the prompt supplies the actual relationship types (imports,
+    calls, renders, instantiates, etc.) so the model describes the real
+    delegation pattern, not a forced request→API→DB template.
+
+    Deterministic fallback: topology-sorted walk of the relationship graph,
+    annotated with the actual relationship type on each edge.
     """
-    # Prepare a compact representation for the LLM
     file_summaries = [
         f"{f['path']} [{f['role']}]" for f in enriched_files[:10]
     ]
     rel_summaries = [
-        f"{r['from']} --{r['type']}--> {r['to']}"
+        f"{r['from'].rsplit('/', 1)[-1]} --{r['type']}--> {r['to'].rsplit('/', 1)[-1]}"
         for r in relationships[:15]
     ]
 
     system_prompt = (
-        "You are a software architect. Given a software feature and its participating "
-        "files with their dependency relationships, describe in 3 to 5 steps how "
-        "execution or data flows through this feature.\n"
-        "Base your steps ONLY on the files and relationships provided. "
-        "Do not invent steps or reference files not listed.\n"
-        "Return ONLY a JSON array of step strings. No markdown, no extra keys."
+        "You are a software architect. Describe in 3–5 steps how execution or data "
+        "flows through the given feature.\n\n"
+        "RULES:\n"
+        "1. Use ONLY the files and relationships provided. Do not reference or invent "
+        "anything not in the list.\n"
+        "2. Use the relationship TYPE (imports, calls, renders, instantiates, extends, "
+        "implements, etc.) to describe HOW files interact — do not use generic verbs.\n"
+        "3. Do NOT force a request→API→service→database pattern or any other template. "
+        "Describe the flow that is actually visible in the relationships.\n"
+        "4. If no clear ordered flow can be established, describe the relationships as "
+        "they are (parallel, bidirectional, etc.).\n"
+        "5. Return ONLY a JSON array of step strings. No markdown, no extra keys."
     )
 
     user_prompt = (
         f"Feature: {feature.get('name')}\n"
         f"Description: {feature.get('description')}\n"
-        f"Participating Files:\n  " + "\n  ".join(file_summaries) + "\n"
-        f"Relationships:\n  " + ("\n  ".join(rel_summaries) if rel_summaries else "  (none)") + "\n\n"
-        'Return JSON array: ["Step 1: ...", "Step 2: ...", "Step 3: ..."]'
+        f"Files:\n  " + "\n  ".join(file_summaries) + "\n"
+        f"Relationships:\n  " + (
+            "\n  ".join(rel_summaries) if rel_summaries else "  (none — isolated feature)"
+        ) + "\n\n"
+        'Return JSON: ["Step 1: ...", "Step 2: ...", ...]'
     )
 
     try:
         raw, _, _ = await execute_hf_llm_call(
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
             max_tokens=600,
             temperature=0.1,
-            stage_name="FEATURE_FLOW"
+            stage_name="FEATURE_FLOW",
         )
         cleaned = strip_markdown_fences(raw)
         ok, parsed, _ = parse_json(cleaned)
@@ -830,64 +1045,85 @@ async def generate_feature_flow(
     except Exception as exc:
         backend_logger.warning(f"[FeatureContext] LLM feature flow notice: {exc}")
 
-    # Deterministic fallback: topological walk of the relationship graph
     return _graph_based_flow_fallback(enriched_files, relationships)
 
 
 def _graph_based_flow_fallback(enriched_files: list, relationships: list) -> list:
     """
-    Constructs a flow description from the actual relationship graph topology.
-    Does not assume REST, frontend, backend, or any framework.
+    Produces a flow description from graph topology alone.
+
+    Uses Kahn's topological sort on the feature's relationship sub-graph.
+    Each step describes an actual edge from the graph, annotated with the
+    real relationship type (imports, calls, renders, etc.).
+
+    Does NOT assume any architectural pattern.
+    If no ordered flow can be determined (cycles, isolated nodes), falls
+    back to listing the relationships that exist.
     """
     if not enriched_files:
         return ["No files selected for this feature."]
 
-    # Build a simple directed adjacency for topological ordering
     path_to_role = {f["path"]: f.get("role", "Source Module") for f in enriched_files}
     all_paths = set(path_to_role.keys())
 
+    # Build adjacency with relationship types
+    out_adj: Dict[str, List[Tuple[str, str]]] = defaultdict(list)  # src → [(tgt, type)]
     in_degree: Dict[str, int] = {p: 0 for p in all_paths}
-    adj: Dict[str, List[str]] = defaultdict(list)
+
     for r in relationships:
-        frm, to = r.get("from"), r.get("to")
+        frm, to = r.get("from", ""), r.get("to", "")
+        rel_type = r.get("type", "uses")
         if frm in all_paths and to in all_paths:
-            adj[frm].append(to)
+            out_adj[frm].append((to, rel_type))
             in_degree[to] = in_degree.get(to, 0) + 1
 
     # Kahn's topological sort
-    queue = deque(p for p in all_paths if in_degree.get(p, 0) == 0)
-    topo_order = []
+    queue: deque = deque(p for p in all_paths if in_degree.get(p, 0) == 0)
+    topo_order: List[str] = []
     while queue:
         node = queue.popleft()
         topo_order.append(node)
-        for neighbour in adj.get(node, []):
-            in_degree[neighbour] -= 1
-            if in_degree[neighbour] == 0:
-                queue.append(neighbour)
+        for nb, _ in out_adj.get(node, []):
+            in_degree[nb] -= 1
+            if in_degree[nb] == 0:
+                queue.append(nb)
 
-    # Add any remaining (cycle members)
+    # Add cycle members (any node not reached by Kahn's)
     for p in all_paths:
         if p not in topo_order:
             topo_order.append(p)
 
-    # Build step descriptions from topology
-    steps = []
+    steps: List[str] = []
+    callers_of = {
+        p: [r.get("from") for r in relationships if r.get("to") == p and r.get("from") in all_paths]
+        for p in all_paths
+    }
+
     for i, path in enumerate(topo_order[:5]):
         role = path_to_role.get(path, "Source Module")
-        filename = path.rsplit("/", 1)[-1]
-        callers = [r["from"] for r in relationships if r.get("to") == path and r.get("from") in all_paths]
-        callees = [r["to"] for r in relationships if r.get("from") == path and r.get("to") in all_paths]
+        fname = path.rsplit("/", 1)[-1]
+        out_edges = out_adj.get(path, [])
+        has_callers = bool(callers_of.get(path))
 
-        if i == 0 and not callers:
-            steps.append(f"Execution begins at {filename} ({role}).")
-        elif callees:
-            callee_names = ", ".join(c.rsplit("/", 1)[-1] for c in callees[:2])
-            steps.append(f"{filename} ({role}) delegates to {callee_names}.")
+        if not has_callers and out_edges:
+            # Entry node: describe its first outgoing edge
+            tgt_fname = out_edges[0][0].rsplit("/", 1)[-1]
+            rel_type = out_edges[0][1]
+            steps.append(f"{fname} ({role}) {rel_type} {tgt_fname}.")
+        elif out_edges:
+            tgt_fname = out_edges[0][0].rsplit("/", 1)[-1]
+            rel_type = out_edges[0][1]
+            steps.append(f"{fname} ({role}) {rel_type} {tgt_fname}.")
         else:
-            steps.append(f"{filename} ({role}) completes processing.")
+            steps.append(f"{fname} ({role}) is a leaf — no further delegation.")
 
+    # If no edges at all, describe the file set
     if not steps:
-        steps = [f"Feature implemented across {len(enriched_files)} file(s)."]
+        if len(enriched_files) == 1:
+            f = enriched_files[0]
+            steps = [f"{f['path'].rsplit('/', 1)[-1]} ({f['role']}) implements this feature."]
+        else:
+            steps = [f"Feature implemented across {len(enriched_files)} file(s) with no detected flow order."]
 
     return steps
 
@@ -898,24 +1134,22 @@ def _graph_based_flow_fallback(enriched_files: list, relationships: list) -> lis
 
 def validate_feature_context(context: dict, code_map: dict) -> dict:
     """
-    Validates the assembled feature context against the code-map ground truth.
-    - Removes any file paths not found in the code-map (hallucination guard).
-    - Removes internal dependency targets not found in the code-map.
-    - Removes relationship entries with invalid endpoints.
+    Validates the assembled context against code-map ground truth.
+    - Removes files not present in the code-map (hallucination guard).
+    - Removes internal dependency targets not in the code-map.
+    - Removes relationship entries whose endpoints were removed.
     """
-    print("[FeatureContext] Validating generated context", flush=True)
-    backend_logger.info("[FeatureContext] Validating generated context")
+    print("[FeatureContext] Validating context", flush=True)
+    backend_logger.info("[FeatureContext] Validating context")
 
     available = set(code_map.get("files", {}).keys())
 
-    # Validate files
     valid_files = []
     for f in context.get("files", []):
         p = f.get("path")
         if p not in available:
             backend_logger.warning(f"[FeatureContext] Discarding hallucinated file: {p}")
             continue
-        # Validate internal dep targets
         if "dependencies" in f:
             f["dependencies"] = [
                 d for d in f["dependencies"]
@@ -924,7 +1158,6 @@ def validate_feature_context(context: dict, code_map: dict) -> dict:
         valid_files.append(f)
     context["files"] = valid_files
 
-    # Validate top-level relationships
     valid_paths = {f["path"] for f in valid_files}
     context["relationships"] = [
         r for r in context.get("relationships", [])
@@ -940,8 +1173,8 @@ def validate_feature_context(context: dict, code_map: dict) -> dict:
 
 def save_feature_contexts(code_map_path: Path, contexts: list) -> list:
     """
-    Saves each validated feature context JSON to the 'feature-context' directory
-    co-located with repository-code-map.json.
+    Saves each validated feature context JSON to feature-context/ co-located
+    with repository-code-map.json.
     """
     target_dir = code_map_path.parent / "feature-context"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -967,13 +1200,13 @@ def save_feature_contexts(code_map_path: Path, contexts: list) -> list:
 # ---------------------------------------------------------------------------
 
 async def generate_all_feature_contexts(
-    code_map_source: Union[str, Path, dict]
+    code_map_source: Union[str, Path, dict],
 ) -> list:
     """
     End-to-end workflow:
     1. Load and normalise repository-code-map.json
-    2. LLM feature discovery (fallback: graph-cluster grouping)
-    3. Graph traversal file selection per feature
+    2. LLM feature discovery  (fallback: semantic graph-cluster refinement)
+    3. Graph-traversal file selection per feature
     4. Evidence-based context assembly
     5. Validation against code-map ground truth
     6. Save feature-context/*.json
@@ -987,8 +1220,8 @@ async def generate_all_feature_contexts(
         if not selected:
             continue
         ctx = await generate_feature_context(feat, selected, code_map)
-        validated_ctx = validate_feature_context(ctx, code_map)
-        contexts.append(validated_ctx)
+        validated = validate_feature_context(ctx, code_map)
+        contexts.append(validated)
 
     if contexts and code_map_path:
         save_feature_contexts(code_map_path, contexts)

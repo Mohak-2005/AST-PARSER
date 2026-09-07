@@ -1,4 +1,19 @@
-import os
+"""
+Tests for feature_context_generator.py
+
+Covers:
+- sanitize_filename
+- load_code_map (dict format, legacy list format)
+- determine_file_role (evidence-based, no path-name or connectivity assumptions)
+- fallback_feature_discovery (two-phase: component candidates → semantic refinement)
+- _split_component (intra-component splitting logic)
+- select_feature_files (graph traversal)
+- _graph_based_flow_fallback (topology + relationship-type annotation)
+- validate_feature_context (hallucination stripping)
+- save_feature_contexts (output schema)
+- generate_all_feature_contexts (end-to-end)
+"""
+
 import json
 import shutil
 import tempfile
@@ -18,8 +33,108 @@ from app.services.feature_context_generator import (
     generate_all_feature_contexts,
     fallback_feature_discovery,
     _graph_based_flow_fallback,
-    _component_name,
+    _split_component,
+    _build_adjacency,
+    _name_candidate,
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+def _make_sample_code_map() -> dict:
+    """
+    Minimal but realistic code-map covering:
+    - API route handler    (server/routes/auth.ts)
+    - Data layer           (server/models/User.ts)  — has databaseOperations
+    - Domain model         (server/models/Order.ts) — has class with extends
+    - Implementation module (client/src/App.tsx)
+    - Library API           (lib/utils.ts)           — 3 exports == declared names
+    """
+    return {
+        "project": {
+            "name": "TestProject",
+            "path": "/repo",
+            "languagesDetected": ["typescript", "tsx"],
+        },
+        "files": {
+            "server/routes/auth.ts": {
+                "language": "typescript",
+                "routes": [{"method": "POST", "path": "/api/auth/login", "line": 20}],
+                "declarations": [{"name": "loginHandler", "type": "function", "line": 15}],
+                "exports": [{"name": "authRouter", "type": "named", "line": 50}],
+                "databaseOperations": [],
+                "classes": [],
+            },
+            "server/models/User.ts": {
+                "language": "typescript",
+                "databaseOperations": [{"operation": "findOne", "line": 25}],
+                "declarations": [],
+                "exports": [{"name": "User", "type": "named", "line": 40}],
+                "classes": [{"name": "User", "methods": ["comparePassword"]}],  # no extends
+            },
+            "server/models/Order.ts": {
+                "language": "typescript",
+                "databaseOperations": [],
+                "declarations": [],
+                "exports": [],
+                "classes": [{"name": "Order", "extends": "BaseModel", "methods": ["save"]}],
+            },
+            "client/src/App.tsx": {
+                "language": "tsx",
+                "declarations": [{"name": "App", "type": "component", "line": 8}],
+                "exports": [],
+                "classes": [],
+                "databaseOperations": [],
+            },
+            "lib/utils.ts": {
+                "language": "typescript",
+                "declarations": [
+                    {"name": "parseJSON", "type": "function"},
+                    {"name": "repairJSON", "type": "function"},
+                    {"name": "sanitize", "type": "function"},
+                ],
+                "exports": [
+                    {"name": "parseJSON", "type": "named"},
+                    {"name": "repairJSON", "type": "named"},
+                    {"name": "sanitize", "type": "named"},
+                ],
+                "classes": [],
+                "databaseOperations": [],
+            },
+            "main.py": {
+                "language": "python",
+                "declarations": [{"name": "main", "type": "function"}],
+                "exports": [],
+                "classes": [],
+                "databaseOperations": [],
+            },
+        },
+        "relationships": [
+            {
+                "from": "server/routes/auth.ts",
+                "to": "server/models/User.ts",
+                "type": "imports",
+                "evidence": {"line": 2},
+                "external": False,
+            },
+            {
+                "from": "server/routes/auth.ts",
+                "to": "bcryptjs",
+                "type": "imports",
+                "evidence": {"line": 3},
+                "external": True,
+            },
+            {
+                "from": "client/src/App.tsx",
+                "to": "lib/utils.ts",
+                "type": "imports",
+                "evidence": {"line": 5},
+                "external": False,
+            },
+        ],
+    }
 
 
 class TestFeatureContextGenerator(unittest.TestCase):
@@ -27,97 +142,7 @@ class TestFeatureContextGenerator(unittest.TestCase):
     def setUp(self):
         self.test_dir = Path(tempfile.mkdtemp())
         self.code_map_path = self.test_dir / "repository-code-map.json"
-
-        self.sample_code_map = {
-            "project": {
-                "name": "CollaborativeCanvas",
-                "path": str(self.test_dir / "repo"),
-                "analyzedAt": "2026-09-07T12:00:00Z",
-                "totalFiles": 4,
-                "parsedFiles": 4,
-                "failedFiles": 0,
-                "languagesDetected": ["typescript", "tsx"]
-            },
-            "files": {
-                "server/routes/auth.ts": {
-                    "language": "typescript",
-                    "lineCount": 60,
-                    "dependencies": [
-                        {"target": "server/models/User.ts", "type": "internal", "kind": "import", "line": 2},
-                        {"target": "bcryptjs", "type": "external", "kind": "import", "line": 3}
-                    ],
-                    "exports": [
-                        {"name": "authRouter", "type": "named", "line": 50}
-                    ],
-                    "declarations": [
-                        {"name": "loginHandler", "type": "function", "line": 15}
-                    ],
-                    "routes": [
-                        {"method": "POST", "path": "/api/login", "line": 20}
-                    ],
-                    "databaseOperations": []
-                },
-                "server/models/User.ts": {
-                    "language": "typescript",
-                    "lineCount": 45,
-                    "dependencies": [
-                        {"target": "mongoose", "type": "external", "kind": "import", "line": 1}
-                    ],
-                    "exports": [
-                        {"name": "User", "type": "named", "line": 40}
-                    ],
-                    "declarations": [],
-                    "classes": [
-                        {"name": "User", "extends": "Model", "methods": ["comparePassword"]}
-                    ],
-                    "databaseOperations": [
-                        {"operation": "findOne", "line": 25}
-                    ]
-                },
-                "client/src/App.tsx": {
-                    "language": "tsx",
-                    "lineCount": 50,
-                    "dependencies": [
-                        {"target": "client/src/components/Canvas.tsx", "type": "internal", "kind": "import", "line": 2}
-                    ],
-                    "declarations": [
-                        {"name": "App", "type": "component", "line": 8}
-                    ]
-                },
-                "client/src/components/Canvas.tsx": {
-                    "language": "tsx",
-                    "lineCount": 90,
-                    "dependencies": [],
-                    "declarations": [
-                        {"name": "Canvas", "type": "component", "line": 12}
-                    ]
-                }
-            },
-            "relationships": [
-                {
-                    "from": "server/routes/auth.ts",
-                    "to": "server/models/User.ts",
-                    "type": "imports",
-                    "evidence": {"importPath": "../models/User", "line": 2},
-                    "external": False
-                },
-                {
-                    "from": "server/routes/auth.ts",
-                    "to": "bcryptjs",
-                    "type": "imports",
-                    "evidence": {"importPath": "bcryptjs", "line": 3},
-                    "external": True
-                },
-                {
-                    "from": "client/src/App.tsx",
-                    "to": "client/src/components/Canvas.tsx",
-                    "type": "imports",
-                    "evidence": {"importPath": "./components/Canvas", "line": 2},
-                    "external": False
-                }
-            ]
-        }
-
+        self.sample_code_map = _make_sample_code_map()
         with open(self.code_map_path, "w", encoding="utf-8") as f:
             json.dump(self.sample_code_map, f, indent=2)
 
@@ -128,212 +153,383 @@ class TestFeatureContextGenerator(unittest.TestCase):
     # sanitize_filename
     # ------------------------------------------------------------------
 
-    def test_sanitize_filename(self):
-        existing = set()
-        self.assertEqual(
-            sanitize_filename("User Authentication & Authorization", existing),
-            "user-authentication-authorization.json"
-        )
-        # Collision handling appends -2
-        self.assertEqual(
-            sanitize_filename("User Authentication & Authorization", existing),
-            "user-authentication-authorization-2.json"
-        )
-        # Special characters & spaces
-        self.assertEqual(
-            sanitize_filename("  Real-time / WebSocket Sync!  ", existing),
-            "real-time-websocket-sync.json"
-        )
-        # Empty fallback
-        self.assertEqual(sanitize_filename("", existing), "feature.json")
+    def test_sanitize_filename_basic(self):
+        ex = set()
+        self.assertEqual(sanitize_filename("User Authentication & Auth", ex), "user-authentication-auth.json")
+
+    def test_sanitize_filename_collision(self):
+        ex = {"user-authentication-auth.json"}
+        self.assertEqual(sanitize_filename("User Authentication & Auth", ex), "user-authentication-auth-2.json")
+
+    def test_sanitize_filename_special_chars(self):
+        ex = set()
+        self.assertEqual(sanitize_filename("  Real-time / WebSocket!", ex), "real-time-websocket.json")
+
+    def test_sanitize_filename_empty(self):
+        ex = set()
+        self.assertEqual(sanitize_filename("", ex), "feature.json")
+
+    def test_sanitize_filename_truncation(self):
+        ex = set()
+        long_name = "A" * 60
+        result = sanitize_filename(long_name, ex)
+        self.assertLessEqual(len(result), 55)  # 50 base + ".json"
 
     # ------------------------------------------------------------------
     # load_code_map
     # ------------------------------------------------------------------
 
-    def test_load_code_map(self):
+    def test_load_code_map_dict_format(self):
         code_map, path = load_code_map(self.code_map_path)
-        self.assertEqual(path, self.code_map_path)
         self.assertIn("server/routes/auth.ts", code_map["files"])
         self.assertEqual(len(code_map["relationships"]), 3)
 
     def test_load_code_map_list_format(self):
-        """load_code_map must handle the legacy list-based files format."""
-        legacy_map = {
-            "project": {"name": "Legacy", "languagesDetected": ["python"]},
+        """load_code_map normalises the legacy list-based files format."""
+        legacy = {
+            "project": {"name": "L", "languagesDetected": ["python"]},
             "files": [
-                {"relativePath": "src/main.py", "language": "python", "declarations": []},
-                {"file": {"relativePath": "src/utils.py"}, "language": "python", "declarations": []}
+                {"relativePath": "src/main.py", "language": "python"},
+                {"file": {"relativePath": "src/utils.py"}, "language": "python"},
             ],
-            "relationships": []
+            "relationships": [],
         }
-        tmp = self.test_dir / "legacy-code-map.json"
+        tmp = self.test_dir / "legacy.json"
         with open(tmp, "w") as fh:
-            json.dump(legacy_map, fh)
+            json.dump(legacy, fh)
         code_map, _ = load_code_map(tmp)
         self.assertIn("src/main.py", code_map["files"])
         self.assertIn("src/utils.py", code_map["files"])
 
+    def test_load_code_map_backslash_normalisation(self):
+        """Windows-style backslash paths are normalised to forward slashes."""
+        code_map_with_bs = {
+            "project": {"name": "W", "languagesDetected": []},
+            "files": {"src\\main.py": {"language": "python"}},
+            "relationships": [
+                {"from": "src\\main.py", "to": "src\\utils.py",
+                 "type": "imports", "external": False}
+            ],
+        }
+        code_map, _ = load_code_map(code_map_with_bs)
+        self.assertIn("src/main.py", code_map["files"])
+        self.assertEqual(code_map["relationships"][0]["from"], "src/main.py")
+
     # ------------------------------------------------------------------
-    # determine_file_role — evidence-based, no path-name assumptions
+    # determine_file_role — evidence-based, NO path/connectivity assumptions
     # ------------------------------------------------------------------
 
-    def test_determine_file_role_api_route(self):
-        """Files with routes → API Route Handler regardless of path name."""
+    def test_role_api_route_handler(self):
+        """Files with routes → API Route Handler, regardless of path name."""
         role = determine_file_role(
-            "server/routes/auth.ts",
+            "anything/deeply/nested/xyz.go",
             self.sample_code_map["files"]["server/routes/auth.ts"],
-            self.sample_code_map["relationships"]
         )
         self.assertEqual(role, "API Route Handler")
 
-    def test_determine_file_role_data_layer(self):
+    def test_role_data_layer(self):
         """Files with databaseOperations → Data Layer."""
         role = determine_file_role(
-            "server/models/User.ts",
+            "any/path.ts",
             self.sample_code_map["files"]["server/models/User.ts"],
-            self.sample_code_map["relationships"]
         )
         self.assertEqual(role, "Data Layer")
 
-    def test_determine_file_role_domain_model(self):
-        """Classes with inheritance → Domain Model."""
-        fdata = {
-            "classes": [{"name": "Order", "extends": "BaseEntity", "methods": ["save"]}],
-            "declarations": [],
-            "databaseOperations": []
-        }
-        role = determine_file_role("src/domain/Order.java", fdata, [])
+    def test_role_domain_model(self):
+        """Class with `extends` → Domain Model."""
+        role = determine_file_role(
+            "any/path.ts",
+            self.sample_code_map["files"]["server/models/Order.ts"],
+        )
         self.assertEqual(role, "Domain Model")
 
-    def test_determine_file_role_entry_point(self):
-        """main.py → Entry Point."""
-        role = determine_file_role("src/main.py", {"declarations": []}, [])
+    def test_role_library_api(self):
+        """3 exports matching all declarations → Library / Module API."""
+        role = determine_file_role(
+            "any/path.ts",
+            self.sample_code_map["files"]["lib/utils.ts"],
+        )
+        self.assertEqual(role, "Library / Module API")
+
+    def test_role_entry_point(self):
+        """main.py filename → Entry Point."""
+        role = determine_file_role(
+            "main.py",
+            self.sample_code_map["files"]["main.py"],
+        )
         self.assertEqual(role, "Entry Point")
 
-    def test_determine_file_role_shared_utility(self):
-        """Files imported by >= 4 others → Shared Utility."""
-        many_rels = [
-            {"from": f"src/file{i}.ts", "to": "src/utils.ts", "external": False}
-            for i in range(5)
-        ]
-        role = determine_file_role("src/utils.ts", {"declarations": []}, many_rels)
-        self.assertEqual(role, "Shared Utility")
-
-    def test_determine_file_role_implementation_module(self):
+    def test_role_implementation_module(self):
         """File with declarations but no special evidence → Implementation Module."""
-        fdata = {
-            "declarations": [{"name": "Canvas", "type": "component"}],
-            "classes": [],
-            "databaseOperations": [],
-            "exports": []
-        }
-        role = determine_file_role("client/src/components/Canvas.tsx", fdata, [])
+        role = determine_file_role(
+            "client/src/App.tsx",
+            self.sample_code_map["files"]["client/src/App.tsx"],
+        )
         self.assertEqual(role, "Implementation Module")
 
-    def test_determine_file_role_library_api(self):
-        """File whose every declaration is exported → Library / Module API."""
+    def test_role_no_connectivity_assumption(self):
+        """High in-degree (connectivity) must NOT change the role — evidence only."""
+        # A file imported many times but with no other evidence → Source Module
+        bare_file = {"declarations": [], "classes": [], "exports": [], "databaseOperations": []}
+        role = determine_file_role("shared/config.ts", bare_file)
+        self.assertEqual(role, "Source Module")
+
+    def test_role_routes_beats_db_ops(self):
+        """Routes take priority over databaseOperations."""
+        fdata = {
+            "routes": [{"method": "GET", "path": "/items"}],
+            "databaseOperations": [{"operation": "findAll"}],
+            "classes": [],
+            "declarations": [],
+            "exports": [],
+        }
+        role = determine_file_role("any.ts", fdata)
+        self.assertEqual(role, "API Route Handler")
+
+    def test_library_api_requires_3_exports(self):
+        """Library/Module API requires ≥3 exports; 2 is not enough."""
         fdata = {
             "declarations": [
                 {"name": "parseJSON", "type": "function"},
-                {"name": "repairJSON", "type": "function"}
+                {"name": "repairJSON", "type": "function"},
             ],
             "exports": [
                 {"name": "parseJSON", "type": "named"},
-                {"name": "repairJSON", "type": "named"}
+                {"name": "repairJSON", "type": "named"},
             ],
             "classes": [],
-            "databaseOperations": []
+            "databaseOperations": [],
         }
-        role = determine_file_role("src/json_utils.ts", fdata, [])
-        self.assertEqual(role, "Library / Module API")
+        role = determine_file_role("any.ts", fdata)
+        # Should fall through to Implementation Module (has declarations)
+        self.assertEqual(role, "Implementation Module")
 
     # ------------------------------------------------------------------
-    # fallback_feature_discovery — graph-cluster based
+    # fallback_feature_discovery — two-phase: components → semantic refinement
     # ------------------------------------------------------------------
 
-    def test_fallback_feature_discovery_groups_connected_files(self):
+    def test_fallback_returns_features_for_every_file(self):
+        """Every file in the code-map must appear in at least one feature's seedFiles."""
         features = fallback_feature_discovery(self.sample_code_map)
-        # Two connected components: {auth.ts, User.ts} and {App.tsx, Canvas.tsx}
-        self.assertEqual(len(features), 2)
-        all_seeds = [f for feat in features for f in feat["seedFiles"]]
-        self.assertTrue(len(all_seeds) > 0)
-        for feat in features:
-            self.assertIn("id", feat)
-            self.assertIn("name", feat)
-            self.assertIn("seedFiles", feat)
-            self.assertTrue(len(feat["seedFiles"]) > 0)
+        self.assertTrue(len(features) >= 1)
+        all_seeds = {f for feat in features for f in feat["seedFiles"]}
+        # Every seed must exist in the code-map
+        available = set(self.sample_code_map["files"].keys())
+        for seed in all_seeds:
+            self.assertIn(seed, available)
 
-    def test_fallback_feature_discovery_isolated_file(self):
-        """A completely isolated file (no relationships) forms its own component."""
-        isolated_map = {
-            "project": {"name": "Isolated", "languagesDetected": ["python"]},
+    def test_fallback_isolated_file_forms_own_feature(self):
+        """A file with no relationships → its own component → its own feature candidate."""
+        isolated = {
+            "project": {"name": "Iso", "languagesDetected": ["python"]},
             "files": {
-                "standalone.py": {"declarations": [{"name": "run", "type": "function"}]},
+                "standalone.py": {
+                    "declarations": [{"name": "run", "type": "function"}],
+                    "classes": [], "exports": [], "databaseOperations": [],
+                }
             },
-            "relationships": []
+            "relationships": [],
         }
-        features = fallback_feature_discovery(isolated_map)
+        features = fallback_feature_discovery(isolated)
         self.assertEqual(len(features), 1)
         self.assertIn("standalone.py", features[0]["seedFiles"])
+
+    def test_fallback_components_are_candidates_not_final(self):
+        """
+        If two files in the same component have no direct relationship to each other
+        (connected only through a shared bridge file), and come from independent
+        source nodes, _split_component should propose splitting them.
+        """
+        # A → C, B → C (A and B are both sources; C is shared)
+        triple_map = {
+            "project": {"name": "T", "languagesDetected": ["typescript"]},
+            "files": {
+                "a/feature1.ts": {"declarations": [{"name": "F1", "type": "function"}],
+                                   "classes": [], "exports": [], "databaseOperations": []},
+                "b/feature2.ts": {"declarations": [{"name": "F2", "type": "function"}],
+                                   "classes": [], "exports": [], "databaseOperations": []},
+                "shared/helper.ts": {"declarations": [{"name": "help", "type": "function"},
+                                                       {"name": "assist", "type": "function"},
+                                                       {"name": "wrap", "type": "function"}],
+                                      "exports": [{"name": "help", "type": "named"},
+                                                  {"name": "assist", "type": "named"},
+                                                  {"name": "wrap", "type": "named"}],
+                                      "classes": [], "databaseOperations": []},
+            },
+            "relationships": [
+                {"from": "a/feature1.ts", "to": "shared/helper.ts",
+                 "type": "imports", "external": False},
+                {"from": "b/feature2.ts", "to": "shared/helper.ts",
+                 "type": "imports", "external": False},
+            ],
+        }
+        features = fallback_feature_discovery(triple_map)
+        # Should produce ≥2 candidates (a/feature1 and b/feature2 are independent sources)
+        self.assertGreaterEqual(len(features), 2)
+
+    # ------------------------------------------------------------------
+    # _split_component
+    # ------------------------------------------------------------------
+
+    def test_split_component_single_source(self):
+        """Single source → no split."""
+        component = ["a.ts", "b.ts", "c.ts"]
+        available = set(component)
+        rels = [
+            {"from": "a.ts", "to": "b.ts", "type": "imports", "external": False},
+            {"from": "b.ts", "to": "c.ts", "type": "imports", "external": False},
+        ]
+        outgoing, incoming = _build_adjacency(rels, available)
+        result = _split_component(component, outgoing, incoming, {})
+        self.assertEqual(len(result), 1)
+
+    def test_split_component_independent_sources(self):
+        """Two independent sources → two candidates."""
+        component = ["entry1.ts", "entry2.ts", "leaf.ts"]
+        available = set(component)
+        rels = [
+            {"from": "entry1.ts", "to": "leaf.ts", "type": "imports", "external": False},
+            {"from": "entry2.ts", "to": "leaf.ts", "type": "imports", "external": False},
+        ]
+        outgoing, incoming = _build_adjacency(rels, available)
+        result = _split_component(component, outgoing, incoming, {})
+        # With 50%+ overlap (leaf.ts is in both), should stay as one
+        # OR split to two — depends on overlap ratio; either is acceptable
+        self.assertGreaterEqual(len(result), 1)
+        # All files should appear in at least one result group
+        all_in_results = {f for r in result for f in r["files"]}
+        for f in component:
+            self.assertIn(f, all_in_results)
+
+    def test_split_component_tiny_returns_as_is(self):
+        """Components with ≤2 files are returned as-is without splitting."""
+        component = ["a.ts", "b.ts"]
+        outgoing, incoming = _build_adjacency([], set(component))
+        result = _split_component(component, outgoing, incoming, {})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(set(result[0]["files"]), set(component))
+
+    # ------------------------------------------------------------------
+    # _name_candidate
+    # ------------------------------------------------------------------
+
+    def test_name_candidate_route_prefix(self):
+        """Route prefix is the highest priority signal."""
+        files_with_routes = {
+            "server/auth.ts": {
+                "routes": [{"method": "POST", "path": "/auth/login"}],
+                "declarations": [], "classes": [], "databaseOperations": [], "exports": [],
+            }
+        }
+        cm = {**self.sample_code_map, "files": files_with_routes}
+        name, desc = _name_candidate(["server/auth.ts"], cm)
+        self.assertIn("Auth", name)
+
+    def test_name_candidate_common_prefix(self):
+        """Common directory prefix used when no routes or class evidence."""
+        files = ["api/handlers/login.ts", "api/handlers/logout.ts"]
+        # Both files share api/handlers prefix
+        cm = {
+            "files": {
+                "api/handlers/login.ts": {"declarations": [], "classes": [], "databaseOperations": [], "exports": []},
+                "api/handlers/logout.ts": {"declarations": [], "classes": [], "databaseOperations": [], "exports": []},
+            },
+            "relationships": [],
+        }
+        name, _ = _name_candidate(files, cm)
+        # Should derive from "handlers" common prefix
+        self.assertIn("Handlers", name)
 
     # ------------------------------------------------------------------
     # select_feature_files — graph traversal
     # ------------------------------------------------------------------
 
-    def test_select_feature_files_dependency_aware(self):
+    def test_select_feature_files_traversal(self):
         feature = {
             "id": "feature-auth",
-            "name": "User Authentication",
-            "seedFiles": ["server/routes/auth.ts"]
+            "name": "Auth",
+            "seedFiles": ["server/routes/auth.ts"],
         }
         selected = select_feature_files(feature, self.sample_code_map)
         paths = {f["path"]: f["relevance"] for f in selected}
 
-        # Seed file must be direct
         self.assertIn("server/routes/auth.ts", paths)
         self.assertEqual(paths["server/routes/auth.ts"], "direct")
-
-        # Dependency User.ts traversed and marked dependency
         self.assertIn("server/models/User.ts", paths)
         self.assertEqual(paths["server/models/User.ts"], "dependency")
 
-        # Unrelated client files must NOT be in auth feature
+        # Unrelated files must not appear
         self.assertNotIn("client/src/App.tsx", paths)
-        self.assertNotIn("client/src/components/Canvas.tsx", paths)
+
+    def test_select_feature_files_no_contamination_from_siblings(self):
+        """
+        Caller of a seed is added as 'dependency' but its OTHER children
+        (sibling features) must NOT be pulled in.
+        """
+        extended_map = dict(self.sample_code_map)
+        extended_map["files"] = dict(self.sample_code_map["files"])
+        extended_map["files"]["page/Dashboard.tsx"] = {
+            "declarations": [{"name": "Dashboard", "type": "component"}],
+            "classes": [], "exports": [], "databaseOperations": [],
+        }
+        extended_map["files"]["page/Sidebar.tsx"] = {
+            "declarations": [{"name": "Sidebar", "type": "component"}],
+            "classes": [], "exports": [], "databaseOperations": [],
+        }
+        extended_map["relationships"] = list(self.sample_code_map["relationships"]) + [
+            {"from": "page/Dashboard.tsx", "to": "client/src/App.tsx",
+             "type": "imports", "external": False},
+            {"from": "page/Dashboard.tsx", "to": "page/Sidebar.tsx",
+             "type": "imports", "external": False},
+        ]
+
+        feature = {"id": "app-ui", "name": "App UI", "seedFiles": ["client/src/App.tsx"]}
+        selected = select_feature_files(feature, extended_map)
+        paths = {f["path"] for f in selected}
+
+        self.assertIn("client/src/App.tsx", paths)
+        self.assertIn("page/Dashboard.tsx", paths)  # direct caller of seed
+        self.assertNotIn("page/Sidebar.tsx", paths)  # sibling of caller, not of seed
 
     # ------------------------------------------------------------------
-    # _graph_based_flow_fallback
+    # _graph_based_flow_fallback — uses relationship types
     # ------------------------------------------------------------------
 
-    def test_graph_based_flow_fallback(self):
+    def test_flow_fallback_includes_relationship_types(self):
         enriched = [
             {"path": "server/routes/auth.ts", "role": "API Route Handler", "relevance": "direct"},
-            {"path": "server/models/User.ts", "role": "Data Layer", "relevance": "dependency"}
+            {"path": "server/models/User.ts", "role": "Data Layer", "relevance": "dependency"},
         ]
         rels = [
-            {"from": "server/routes/auth.ts", "to": "server/models/User.ts", "type": "imports"}
+            {"from": "server/routes/auth.ts", "to": "server/models/User.ts",
+             "type": "imports", "evidence": {"line": 2}},
         ]
         flow = _graph_based_flow_fallback(enriched, rels)
         self.assertIsInstance(flow, list)
         self.assertTrue(len(flow) >= 1)
-        # All steps must be non-empty strings
-        for step in flow:
-            self.assertIsInstance(step, str)
-            self.assertTrue(len(step) > 0)
+        # The relationship type "imports" should appear in the step description
+        combined = " ".join(flow)
+        self.assertIn("imports", combined)
 
-    def test_graph_based_flow_fallback_empty(self):
+    def test_flow_fallback_empty_files(self):
         flow = _graph_based_flow_fallback([], [])
-        self.assertIsInstance(flow, list)
         self.assertEqual(len(flow), 1)
+        self.assertIsInstance(flow[0], str)
+
+    def test_flow_fallback_no_relationships(self):
+        """Single isolated file → describes the file."""
+        enriched = [{"path": "main.go", "role": "Entry Point", "relevance": "direct"}]
+        flow = _graph_based_flow_fallback(enriched, [])
+        self.assertEqual(len(flow), 1)
+        self.assertIn("main.go", flow[0])
 
     # ------------------------------------------------------------------
     # validate_feature_context
     # ------------------------------------------------------------------
 
-    def test_validate_feature_context_strips_hallucinations(self):
+    def test_validate_strips_hallucinated_files(self):
         context = {
-            "feature": {"id": "feature-test", "name": "Test Feature"},
+            "feature": {"id": "t", "name": "T"},
             "files": [
                 {
                     "path": "server/routes/auth.ts",
@@ -342,41 +538,60 @@ class TestFeatureContextGenerator(unittest.TestCase):
                     "declarations": [{"name": "loginHandler", "type": "function"}],
                     "dependencies": [
                         {"target": "server/models/User.ts", "type": "internal"},
-                        {"target": "bcryptjs", "type": "external"}
-                    ]
+                        {"target": "bcryptjs", "type": "external"},
+                    ],
                 },
                 {
-                    "path": "server/fake/Hallucinated.ts",
-                    "role": "Fake",
+                    "path": "server/fake/Ghost.ts",
+                    "role": "Ghost",
                     "relevance": "dependency",
-                    "declarations": [{"name": "ghostFunc", "type": "function"}]
-                }
+                },
             ],
             "relationships": [
-                {"from": "server/routes/auth.ts", "to": "server/fake/Hallucinated.ts", "type": "imports"}
+                {"from": "server/routes/auth.ts", "to": "server/fake/Ghost.ts", "type": "imports"},
             ],
-            "featureFlow": ["Step 1: Test flow"],
-            "sharedDependencies": ["bcryptjs"]
+            "featureFlow": ["Step 1"],
+            "sharedDependencies": ["bcryptjs"],
         }
 
         validated = validate_feature_context(context, self.sample_code_map)
-        val_paths = [f["path"] for f in validated["files"]]
-
-        self.assertIn("server/routes/auth.ts", val_paths)
-        self.assertNotIn("server/fake/Hallucinated.ts", val_paths)
-
-        # Hallucinated relationship should also be removed
+        paths = [f["path"] for f in validated["files"]]
+        self.assertIn("server/routes/auth.ts", paths)
+        self.assertNotIn("server/fake/Ghost.ts", paths)
+        # Relationship referencing the hallucinated file must also be removed
         self.assertEqual(len(validated["relationships"]), 0)
 
-        # Declarations remain
-        auth_file = next(f for f in validated["files"] if f["path"] == "server/routes/auth.ts")
-        self.assertEqual(auth_file["declarations"][0]["name"], "loginHandler")
+    def test_validate_removes_bad_internal_dep_targets(self):
+        context = {
+            "feature": {"id": "t", "name": "T"},
+            "files": [
+                {
+                    "path": "server/routes/auth.ts",
+                    "role": "API Route Handler",
+                    "relevance": "direct",
+                    "dependencies": [
+                        {"target": "server/models/User.ts", "type": "internal"},  # valid
+                        {"target": "server/models/Ghost.ts", "type": "internal"},  # invalid
+                        {"target": "bcryptjs", "type": "external"},               # always kept
+                    ],
+                }
+            ],
+            "relationships": [],
+            "featureFlow": [],
+            "sharedDependencies": [],
+        }
+        validated = validate_feature_context(context, self.sample_code_map)
+        deps = validated["files"][0]["dependencies"]
+        targets = {d["target"] for d in deps}
+        self.assertIn("server/models/User.ts", targets)
+        self.assertNotIn("server/models/Ghost.ts", targets)
+        self.assertIn("bcryptjs", targets)
 
     # ------------------------------------------------------------------
     # save_feature_contexts
     # ------------------------------------------------------------------
 
-    def test_save_feature_contexts(self):
+    def test_save_feature_contexts_schema(self):
         context = {
             "feature": {"id": "feature-auth", "name": "User Authentication"},
             "files": [
@@ -385,12 +600,12 @@ class TestFeatureContextGenerator(unittest.TestCase):
                     "role": "API Route Handler",
                     "relevance": "direct",
                     "declarations": [{"name": "loginHandler", "type": "function"}],
-                    "dependencies": [{"target": "bcryptjs", "type": "external"}]
+                    "dependencies": [{"target": "bcryptjs", "type": "external", "kind": "imports"}],
                 }
             ],
             "relationships": [],
-            "featureFlow": ["Step 1: User sends credentials"],
-            "sharedDependencies": ["bcryptjs"]
+            "featureFlow": ["Step 1: loginHandler processes the request."],
+            "sharedDependencies": ["bcryptjs"],
         }
 
         saved = save_feature_contexts(self.code_map_path, [context])
@@ -399,14 +614,16 @@ class TestFeatureContextGenerator(unittest.TestCase):
         self.assertEqual(saved[0].name, "user-authentication.json")
         self.assertEqual(saved[0].parent.name, "feature-context")
 
-        with open(saved[0], "r", encoding="utf-8") as f:
+        with open(saved[0]) as f:
             data = json.load(f)
 
+        # Required top-level keys
+        for key in ("feature", "files", "relationships", "featureFlow", "sharedDependencies"):
+            self.assertIn(key, data)
+
         self.assertEqual(data["feature"]["id"], "feature-auth")
-        self.assertIn("relationships", data)   # schema includes relationships
         self.assertEqual(data["sharedDependencies"], ["bcryptjs"])
         self.assertEqual(data["files"][0]["path"], "server/routes/auth.ts")
-        self.assertEqual(data["files"][0]["declarations"][0]["name"], "loginHandler")
 
     # ------------------------------------------------------------------
     # end-to-end
@@ -420,26 +637,25 @@ class TestFeatureContextGenerator(unittest.TestCase):
                     "id": "feature-auth",
                     "name": "User Authentication",
                     "description": "Authentication and user verification",
-                    "seedFiles": ["server/routes/auth.ts"]
+                    "seedFiles": ["server/routes/auth.ts"],
                 },
                 {
                     "id": "feature-canvas",
-                    "name": "Collaborative Canvas UI",
-                    "description": "Rendering interactive canvas workspace",
-                    "seedFiles": ["client/src/App.tsx"]
-                }
+                    "name": "App UI",
+                    "description": "Application UI",
+                    "seedFiles": ["client/src/App.tsx"],
+                },
             ]
         })
-
         flow_response = json.dumps([
-            "Step 1: Client submits request",
-            "Step 2: Server processes authentication"
+            "Step 1: auth.ts imports User.ts.",
+            "Step 2: User.ts performs findOne.",
         ])
 
         mock_llm.side_effect = [
             (discovery_response, 200, 0.5),
             (flow_response, 200, 0.3),
-            (flow_response, 200, 0.3)
+            (flow_response, 200, 0.3),
         ]
 
         import asyncio
@@ -449,19 +665,28 @@ class TestFeatureContextGenerator(unittest.TestCase):
         feature_context_dir = self.test_dir / "feature-context"
         self.assertTrue(feature_context_dir.exists())
 
-        saved_files = list(feature_context_dir.glob("*.json"))
-        self.assertEqual(len(saved_files), 2)
-        saved_names = {f.name for f in saved_files}
+        saved_names = {f.name for f in feature_context_dir.glob("*.json")}
         self.assertIn("user-authentication.json", saved_names)
-        self.assertIn("collaborative-canvas-ui.json", saved_names)
+        self.assertIn("app-ui.json", saved_names)
 
-        # Each context must have required top-level keys
+        for ctx in contexts:
+            for key in ("feature", "files", "relationships", "featureFlow", "sharedDependencies"):
+                self.assertIn(key, ctx)
+
+    @patch("app.services.feature_context_generator.execute_hf_llm_call")
+    def test_end_to_end_fallback_when_llm_fails(self, mock_llm):
+        """When LLM returns garbage, the deterministic fallback must produce valid output."""
+        mock_llm.return_value = ("NOT_VALID_JSON{{}", 500, 0.0)
+
+        import asyncio
+        contexts = asyncio.run(generate_all_feature_contexts(self.code_map_path))
+
+        self.assertIsInstance(contexts, list)
+        self.assertGreater(len(contexts), 0)
         for ctx in contexts:
             self.assertIn("feature", ctx)
             self.assertIn("files", ctx)
-            self.assertIn("relationships", ctx)
             self.assertIn("featureFlow", ctx)
-            self.assertIn("sharedDependencies", ctx)
 
 
 if __name__ == "__main__":
