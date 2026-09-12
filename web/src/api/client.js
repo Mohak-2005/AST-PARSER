@@ -28,3 +28,17 @@ export const generateFeatureContext = (params) =>
     '/api/feature-context',
     typeof params === 'string' ? { codeMapPath: params } : params
   );
+
+// Checks whether valid unit test case files already exist for the current project.
+export const checkTestCases = (params) =>
+  backendApi.get('/api/test-cases', {
+    params: typeof params === 'string' ? { codeMapPath: params } : params,
+  });
+
+// Triggers Unit Test Case Generation service for the current project.
+export const generateTestCases = (params) =>
+  backendApi.post(
+    '/api/test-cases',
+    typeof params === 'string' ? { codeMapPath: params } : params
+  );
+

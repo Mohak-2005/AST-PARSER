@@ -133,3 +133,19 @@ class FeatureContextResponse(BaseModel):
     savedFiles: list[str] = []
     message: str = "Feature contexts generated successfully"
     alreadyExists: bool = False
+
+
+class UnitTestCaseRequest(BaseModel):
+    codeMapPath: Optional[str] = None
+    projectId: Optional[str] = None
+    force: Optional[bool] = False
+
+
+class UnitTestCaseResponse(BaseModel):
+    status: str
+    testCaseCount: int = 0
+    unitCount: int = 0
+    savedFiles: list[str] = []
+    message: str = "Unit test cases generated successfully"
+    alreadyExists: bool = False
+

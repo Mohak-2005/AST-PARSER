@@ -9,8 +9,13 @@ export default function ProjectSelector({ onAnalyze, error }) {
   const [backendOk, setBackendOk] = useState(null);
   
   useEffect(() => {
-    checkAgentHealth().then(() => setAgentOk(true)).catch(() => setAgentOk(false));
-    checkBackendHealth().then(() => setBackendOk(true)).catch(() => setBackendOk(false));
+    const checkStatus = () => {
+      checkAgentHealth().then(() => setAgentOk(true)).catch(() => setAgentOk(false));
+      checkBackendHealth().then(() => setBackendOk(true)).catch(() => setBackendOk(false));
+    };
+    checkStatus();
+    const interval = setInterval(checkStatus, 3000);
+    return () => clearInterval(interval);
   }, []);
   
   const handleSubmit = async (e) => {

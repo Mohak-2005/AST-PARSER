@@ -5,8 +5,8 @@ import ProgressPanel from './components/ProgressPanel';
 import GraphView from './components/GraphView';
 import NodeDetails from './components/NodeDetails';
 import EdgeDetails from './components/EdgeDetails';
-import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext, checkFeatureContext } from './api/client';
-import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext, checkFeatureContext, checkTestCases, generateTestCases } from './api/client';
+import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2, TestTube2 } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState('home'); // 'home' | 'analyzing' | 'graph'
@@ -21,6 +21,83 @@ export default function App() {
 
   // Feature Context Generation state — idle | loading | already_exists | success | error
   const [featureCtx, setFeatureCtx] = useState({ status: 'idle', step: 'idle', message: null, data: null });
+
+  // Unit Test Cases Generation state — idle | loading | already_exists | success | error
+  const [testCasesState, setTestCasesState] = useState({ status: 'idle', step: 'idle', message: null, data: null });
+
+  const handleGenerateTestCases = async () => {
+    // Prevent duplicate requests while running
+    if (testCasesState.status === 'loading') return;
+
+    const codeMapPath =
+      graphData?.codeMap?.project?.codeMapPath ||
+      graphData?.codeMap?.codeMapPath ||
+      null;
+
+    if (!codeMapPath && !projectId) {
+      setTestCasesState({
+        status: 'error',
+        step: 'idle',
+        message: 'No code map path available for this project. Re-analyze to enable test case generation.',
+        data: null,
+      });
+      return;
+    }
+
+    const payload = { codeMapPath, projectId };
+
+    // STEP 1: Check whether test cases already exist FIRST
+    setTestCasesState({ status: 'loading', step: 'checking', message: 'Checking existing test cases…', data: null });
+
+    try {
+      const checkRes = await checkTestCases(payload);
+      if (checkRes.data?.alreadyExists) {
+        setTestCasesState({
+          status: 'already_exists',
+          step: 'done',
+          message: checkRes.data.message || 'Unit test cases already generated.',
+          data: checkRes.data,
+        });
+        return;
+      }
+    } catch (checkErr) {
+      console.warn('[UnitTestGenerator] Check notice:', checkErr);
+    }
+
+    // STEP 2: Generate unit test cases via backend
+    setTestCasesState({
+      status: 'loading',
+      step: 'generating',
+      message: 'Generating Unit Test Cases...',
+      data: null,
+    });
+
+    try {
+      const { data } = await generateTestCases(payload);
+      if (data.alreadyExists) {
+        setTestCasesState({
+          status: 'already_exists',
+          step: 'done',
+          message: data.message || 'Unit test cases already generated.',
+          data,
+        });
+      } else {
+        setTestCasesState({
+          status: 'success',
+          step: 'done',
+          message: data.message || `Unit test cases generated successfully (${data.testCaseCount || 0} tests).`,
+          data,
+        });
+      }
+    } catch (err) {
+      const errMsg =
+        err.response?.data?.detail ||
+        err.response?.data?.error ||
+        err.message ||
+        'Unit test case generation failed';
+      setTestCasesState({ status: 'error', step: 'idle', message: errMsg, data: null });
+    }
+  };
 
   const handleGenerateFeatureContext = async () => {
     // Prevent duplicate requests while running
@@ -99,6 +176,7 @@ export default function App() {
     }
   };
 
+
   const startPolling = useCallback(() => {
     const interval = setInterval(async () => {
       try {
@@ -113,6 +191,23 @@ export default function App() {
             setSelectedNode(null);
             setSelectedEdge(null);
             setView('graph');
+
+            const cmPath = graphRes.data?.codeMap?.project?.codeMapPath || graphRes.data?.codeMap?.codeMapPath || null;
+            try {
+              const fcRes = await checkFeatureContext({ codeMapPath: cmPath, projectId: data.projectId });
+              if (fcRes.data?.alreadyExists) {
+                setFeatureCtx({
+                  status: 'already_exists',
+                  step: 'done',
+                  message: fcRes.data.message || `Feature context already generated for ${fcRes.data.featureCount} features.`,
+                  data: fcRes.data,
+                });
+              } else {
+                setFeatureCtx({ status: 'idle', step: 'idle', message: null, data: null });
+              }
+            } catch (e) {
+              setFeatureCtx({ status: 'idle', step: 'idle', message: null, data: null });
+            }
           } catch(err) {
             setError('Failed to fetch graph data after analysis');
             setView('home');
@@ -167,6 +262,41 @@ export default function App() {
       setSelectedNode(null);
       setSelectedEdge(null);
       setView('graph');
+
+      // Dynamically detect existing feature-context and test-cases
+      const codeMapPath = data?.codeMap?.project?.codeMapPath || data?.codeMap?.codeMapPath || null;
+      try {
+        const fcRes = await checkFeatureContext({ codeMapPath, projectId: pid });
+        if (fcRes.data?.alreadyExists) {
+          setFeatureCtx({
+            status: 'already_exists',
+            step: 'done',
+            message: fcRes.data.message || `Feature context already generated for ${fcRes.data.featureCount} features.`,
+            data: fcRes.data,
+          });
+          try {
+            const tcRes = await checkTestCases({ codeMapPath, projectId: pid });
+            if (tcRes.data?.alreadyExists) {
+              setTestCasesState({
+                status: 'already_exists',
+                step: 'done',
+                message: tcRes.data.message || 'Unit test cases already generated.',
+                data: tcRes.data,
+              });
+            } else {
+              setTestCasesState({ status: 'idle', step: 'idle', message: null, data: null });
+            }
+          } catch (e) {
+            setTestCasesState({ status: 'idle', step: 'idle', message: null, data: null });
+          }
+        } else {
+          setFeatureCtx({ status: 'idle', step: 'idle', message: null, data: null });
+          setTestCasesState({ status: 'idle', step: 'idle', message: null, data: null });
+        }
+      } catch (e) {
+        setFeatureCtx({ status: 'idle', step: 'idle', message: null, data: null });
+        setTestCasesState({ status: 'idle', step: 'idle', message: null, data: null });
+      }
     } catch (e) {
       setError('Failed to load project graph');
     }
@@ -181,6 +311,7 @@ export default function App() {
     setSelectedEdge(null);
     setGraphLookup(null);
     setFeatureCtx({ status: 'idle', message: null, data: null });
+    setTestCasesState({ status: 'idle', message: null, data: null });
   };
 
   const handleNodeClick = (node, lookup) => {
@@ -225,6 +356,33 @@ export default function App() {
 
           {view === 'graph' && (
             <div className="flex items-center gap-3">
+              {/* Generate Test Cases button - visible ONLY when feature-context generation has successfully completed */}
+              {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
+                <button
+                  onClick={handleGenerateTestCases}
+                  disabled={testCasesState.status === 'loading'}
+                  className="flex items-center gap-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-emerald-600"
+                  title="Generate unit test case specifications from the current project's code map"
+                >
+                  {testCasesState.status === 'loading' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : testCasesState.status === 'already_exists' || testCasesState.status === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-300" />
+                  ) : testCasesState.status === 'error' ? (
+                    <AlertCircle className="w-4 h-4" />
+                  ) : (
+                    <TestTube2 className="w-4 h-4" />
+                  )}
+                  {testCasesState.status === 'loading'
+                    ? 'Generating Test Cases...'
+                    : testCasesState.status === 'already_exists'
+                    ? 'Test Cases Already Generated'
+                    : testCasesState.status === 'success'
+                    ? 'Test Cases Generated'
+                    : 'Generate Test Cases'}
+                </button>
+              )}
+
               {/* Generate Feature Context button */}
               <button
                 onClick={handleGenerateFeatureContext}
@@ -262,38 +420,73 @@ export default function App() {
           )}
         </div>
 
-        {/* Feature context status bar — only shown in graph view when there is a message */}
-        {view === 'graph' && featureCtx.status !== 'idle' && (
-          <div
-            className={`text-xs px-2 pb-2 flex items-center gap-2 ${
-              featureCtx.status === 'success' || featureCtx.status === 'already_exists'
-                ? 'text-emerald-400'
-                : featureCtx.status === 'error'
-                ? 'text-red-400'
-                : 'text-slate-400'
-            }`}
-          >
-            {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
-              <>
-                <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
-                {featureCtx.message}
-              </>
+        {/* Status bar — shown in graph view when there is a feature-context or test-case message */}
+        {view === 'graph' && (featureCtx.status !== 'idle' || testCasesState.status !== 'idle') && (
+          <div className="flex flex-col gap-1 px-2 pb-2">
+            {featureCtx.status !== 'idle' && (
+              <div
+                className={`text-xs flex items-center gap-2 ${
+                  featureCtx.status === 'success' || featureCtx.status === 'already_exists'
+                    ? 'text-emerald-400'
+                    : featureCtx.status === 'error'
+                    ? 'text-red-400'
+                    : 'text-slate-400'
+                }`}
+              >
+                {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
+                  <>
+                    <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
+                    {featureCtx.message}
+                  </>
+                )}
+                {featureCtx.status === 'error' && (
+                  <>
+                    <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                    {featureCtx.message}
+                  </>
+                )}
+                {featureCtx.status === 'loading' && (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+                    {featureCtx.message || 'Generating Feature Context...'}
+                  </>
+                )}
+              </div>
             )}
-            {featureCtx.status === 'error' && (
-              <>
-                <AlertCircle className="w-3 h-3 flex-shrink-0" />
-                {featureCtx.message}
-              </>
-            )}
-            {featureCtx.status === 'loading' && (
-              <>
-                <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
-                {featureCtx.message || 'Generating Feature Context...'}
-              </>
+            {testCasesState.status !== 'idle' && (
+              <div
+                className={`text-xs flex items-center gap-2 ${
+                  testCasesState.status === 'success' || testCasesState.status === 'already_exists'
+                    ? 'text-emerald-400'
+                    : testCasesState.status === 'error'
+                    ? 'text-red-400'
+                    : 'text-slate-400'
+                }`}
+              >
+                {(testCasesState.status === 'success' || testCasesState.status === 'already_exists') && (
+                  <>
+                    <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
+                    {testCasesState.message}
+                  </>
+                )}
+                {testCasesState.status === 'error' && (
+                  <>
+                    <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                    {testCasesState.message}
+                  </>
+                )}
+                {testCasesState.status === 'loading' && (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+                    {testCasesState.message || 'Generating Unit Test Cases...'}
+                  </>
+                )}
+              </div>
             )}
           </div>
         )}
       </header>
+
 
       {/* Main Content */}
       <main className="flex-grow relative overflow-hidden">

@@ -55,7 +55,7 @@ app.post('/agent/analyze', (req, res) => {
   });
 });
 
-const server = app.listen(config.port, () => {
+const server = app.listen(config.port, '0.0.0.0', () => {
   logger.info('STARTUP', `Local Agent listening on port ${config.port}`);
   logger.info('STARTUP', `Analysis output directory: ${config.analysisOutputDir}`);
 });

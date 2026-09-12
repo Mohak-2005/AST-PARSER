@@ -10,7 +10,9 @@ from app.models.schemas import (
     AnalyzeResponse,
     GraphData,
     FeatureContextRequest,
-    FeatureContextResponse
+    FeatureContextResponse,
+    UnitTestCaseRequest,
+    UnitTestCaseResponse,
 )
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
@@ -18,6 +20,10 @@ from app.services.db_repository import save_project, save_graph, get_graph
 from app.services.feature_context_generator import (
     generate_all_feature_contexts,
     get_existing_feature_contexts,
+)
+from app.services.unit_test_generator import (
+    generate_all_unit_test_cases,
+    get_existing_test_cases,
 )
 from app.logger import backend_logger, log_stage, log_error
 
@@ -224,3 +230,67 @@ async def create_feature_contexts_endpoint(req: FeatureContextRequest):
     except Exception as exc:
         backend_logger.error(f"[FeatureContext] Endpoint error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/test-cases", response_model=UnitTestCaseResponse)
+async def check_unit_test_cases_endpoint(
+    codeMapPath: Optional[str] = None,
+    projectId: Optional[str] = None,
+):
+    code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    existing_files = get_existing_test_cases(code_map_source)
+    if existing_files:
+        return UnitTestCaseResponse(
+            status="already_exists",
+            alreadyExists=True,
+            testCaseCount=len(existing_files),
+            savedFiles=[f.name for f in existing_files],
+            message="Unit test cases already generated.",
+        )
+    return UnitTestCaseResponse(
+        status="not_found",
+        alreadyExists=False,
+        testCaseCount=0,
+        savedFiles=[],
+        message="No unit test cases generated yet.",
+    )
+
+
+@router.post("/api/test-cases", response_model=UnitTestCaseResponse)
+async def create_unit_test_cases_endpoint(req: UnitTestCaseRequest):
+    code_map_source = await _resolve_code_map_source(req.codeMapPath, req.projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    # Guard check: Do not invoke LLM if valid test cases exist and force is False
+    if not req.force:
+        existing_files = get_existing_test_cases(code_map_source)
+        if existing_files:
+            return UnitTestCaseResponse(
+                status="already_exists",
+                alreadyExists=True,
+                testCaseCount=len(existing_files),
+                savedFiles=[f.name for f in existing_files],
+                message="Unit test cases already generated.",
+            )
+
+    try:
+        res = await generate_all_unit_test_cases(code_map_source, force=bool(req.force))
+        return UnitTestCaseResponse(
+            status=res.get("status", "success"),
+            alreadyExists=res.get("alreadyExists", False),
+            testCaseCount=res.get("testCaseCount", 0),
+            unitCount=res.get("unitCount", 0),
+            savedFiles=res.get("savedFiles", []),
+            message=res.get("message", "Unit test cases generated successfully."),
+        )
+    except ValueError as val_err:
+        backend_logger.warning(f"[UnitTestGenerator] Input/validation notice: {val_err}")
+        raise HTTPException(status_code=422, detail=str(val_err))
+    except Exception as exc:
+        backend_logger.error(f"[UnitTestGenerator] Endpoint error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+

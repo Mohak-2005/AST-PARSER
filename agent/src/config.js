@@ -1,8 +1,9 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const { registry } = require('./languageRegistry');
 
 module.exports = {
-  port: process.env.PORT || 3001,
+  port: parseInt(process.env.PORT || '3001', 10),
   backendUrl: process.env.BACKEND_URL || 'http://localhost:5000',
   analysisOutputDir: process.env.ANALYSIS_OUTPUT_DIR || 'C:\\Users\\Mohak\\Desktop\\test',
   ignoreDirs: (process.env.IGNORE_DIRS || '.git,.venv,venv,env,ENV,node_modules,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,.cache,dist,build,coverage,target,out,bin,obj,.next,.nuxt,.turbo,.parcel-cache,vendor,.nyc_output').split(','),
