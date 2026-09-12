@@ -149,3 +149,18 @@ class UnitTestCaseResponse(BaseModel):
     message: str = "Unit test cases generated successfully"
     alreadyExists: bool = False
 
+
+class RetrievedCodeRequest(BaseModel):
+    codeMapPath: Optional[str] = None
+    projectId: Optional[str] = None
+    projectPath: Optional[str] = None
+
+
+class RetrievedCodeResponse(BaseModel):
+    status: str
+    retrievedCount: int = 0
+    savedFiles: list[str] = []
+    files: list[dict] = []
+    message: str = ""
+    alreadyExists: bool = False
+

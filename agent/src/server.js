@@ -3,6 +3,7 @@ const cors = require('cors');
 const fs = require('fs');
 const config = require('./config');
 const { runAnalysis } = require('./analysisRunner');
+const { retrieveCodeForProject, getRetrievedCodeFiles } = require('./retrievalEngine');
 const { logger } = require('./logger');
 
 const app = express();
@@ -53,6 +54,32 @@ app.post('/agent/analyze', (req, res) => {
     message: 'Analysis started',
     projectPath
   });
+});
+
+app.post('/agent/retrieve-code', async (req, res) => {
+  const { projectPath, codeMapPath, projectId } = req.body || {};
+  logger.info('RETRIEVAL_REQUEST', 'Received retrieve-code request', { projectPath, codeMapPath, projectId });
+  try {
+    const result = await retrieveCodeForProject({ projectPath, codeMapPath, projectId });
+    if (result.status === 'error') {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    logger.error('RETRIEVAL_ENGINE', `Retrieval failed: ${err.message}`, { error: err.stack });
+    return res.status(500).json({ error: 'Retrieval failed', detail: err.message });
+  }
+});
+
+app.get('/agent/retrieved-code', (req, res) => {
+  const { projectPath, codeMapPath, projectId } = req.query || {};
+  try {
+    const result = getRetrievedCodeFiles({ projectPath, codeMapPath, projectId });
+    return res.json(result);
+  } catch (err) {
+    logger.error('RETRIEVAL_ENGINE', `Error listing retrieved code: ${err.message}`);
+    return res.status(500).json({ error: 'Failed to list retrieved code', detail: err.message });
+  }
 });
 
 const server = app.listen(config.port, '0.0.0.0', () => {

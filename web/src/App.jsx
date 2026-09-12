@@ -5,8 +5,19 @@ import ProgressPanel from './components/ProgressPanel';
 import GraphView from './components/GraphView';
 import NodeDetails from './components/NodeDetails';
 import EdgeDetails from './components/EdgeDetails';
-import { startAnalysis, getAgentStatus, getGraph, generateFeatureContext, checkFeatureContext, checkTestCases, generateTestCases } from './api/client';
-import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2, TestTube2 } from 'lucide-react';
+import RetrievedCodeModal from './components/RetrievedCodeModal';
+import {
+  startAnalysis,
+  getAgentStatus,
+  getGraph,
+  generateFeatureContext,
+  checkFeatureContext,
+  checkTestCases,
+  generateTestCases,
+  checkRetrievedCode,
+  retrieveCode
+} from './api/client';
+import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2, TestTube2, Code2 } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState('home'); // 'home' | 'analyzing' | 'graph'
@@ -24,6 +35,14 @@ export default function App() {
 
   // Unit Test Cases Generation state — idle | loading | already_exists | success | error
   const [testCasesState, setTestCasesState] = useState({ status: 'idle', step: 'idle', message: null, data: null });
+
+  // Retrieved Code inspection modal state
+  const [retrievedCodeModal, setRetrievedCodeModal] = useState({
+    isOpen: false,
+    loading: false,
+    files: [],
+    error: null
+  });
 
   const handleGenerateTestCases = async () => {
     // Prevent duplicate requests while running
@@ -89,6 +108,13 @@ export default function App() {
           data,
         });
       }
+
+      // Automatically trigger Local Agent code retrieval in background
+      try {
+        retrieveCode(payload);
+      } catch (e) {
+        console.warn('[RetrievedCode] Background retrieval notice:', e);
+      }
     } catch (err) {
       const errMsg =
         err.response?.data?.detail ||
@@ -96,6 +122,75 @@ export default function App() {
         err.message ||
         'Unit test case generation failed';
       setTestCasesState({ status: 'error', step: 'idle', message: errMsg, data: null });
+    }
+  };
+
+  const handleOpenRetrievedCode = async () => {
+    const codeMapPath =
+      graphData?.codeMap?.project?.codeMapPath ||
+      graphData?.codeMap?.codeMapPath ||
+      null;
+
+    setRetrievedCodeModal((prev) => ({ ...prev, isOpen: true, loading: true, error: null }));
+
+    try {
+      // First check if retrieved code already exists
+      const checkRes = await checkRetrievedCode({ codeMapPath, projectId });
+      if (checkRes.data?.status === 'success' && checkRes.data.files?.length > 0) {
+        setRetrievedCodeModal((prev) => ({
+          ...prev,
+          isOpen: true,
+          loading: false,
+          files: checkRes.data.files,
+        }));
+        return;
+      }
+
+      // If not yet retrieved, run retrieval engine
+      const retrieveRes = await retrieveCode({ codeMapPath, projectId });
+      if (retrieveRes.data?.status === 'success') {
+        const filesRes = await checkRetrievedCode({ codeMapPath, projectId });
+        setRetrievedCodeModal((prev) => ({
+          ...prev,
+          isOpen: true,
+          loading: false,
+          files: filesRes.data?.files || [],
+        }));
+      } else {
+        setRetrievedCodeModal((prev) => ({
+          ...prev,
+          loading: false,
+          error: retrieveRes.data?.message || 'Could not retrieve source code',
+        }));
+      }
+    } catch (err) {
+      console.error('[RetrievedCode] Error:', err);
+      setRetrievedCodeModal((prev) => ({
+        ...prev,
+        loading: false,
+        error: err.response?.data?.detail || err.message || 'Failed to retrieve code',
+      }));
+    }
+  };
+
+  const handleRefreshRetrievedCode = async () => {
+    const codeMapPath =
+      graphData?.codeMap?.project?.codeMapPath ||
+      graphData?.codeMap?.codeMapPath ||
+      null;
+
+    setRetrievedCodeModal((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      await retrieveCode({ codeMapPath, projectId });
+      const filesRes = await checkRetrievedCode({ codeMapPath, projectId });
+      setRetrievedCodeModal((prev) => ({
+        ...prev,
+        loading: false,
+        files: filesRes.data?.files || [],
+      }));
+    } catch (err) {
+      console.error('[RetrievedCode] Refresh error:', err);
+      setRetrievedCodeModal((prev) => ({ ...prev, loading: false }));
     }
   };
 
@@ -356,6 +451,18 @@ export default function App() {
 
           {view === 'graph' && (
             <div className="flex items-center gap-3">
+              {/* Retrieved Code button - visible ONLY when test cases have been generated, placed immediately to the LEFT of Generated Test Cases */}
+              {(testCasesState.status === 'success' || testCasesState.status === 'already_exists') && (
+                <button
+                  onClick={handleOpenRetrievedCode}
+                  className="flex items-center gap-2 bg-indigo-700 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-indigo-600 shadow-sm"
+                  title="Inspect retrieved project source code for generated unit test cases"
+                >
+                  <Code2 className="w-4 h-4" />
+                  Retrieved Code
+                </button>
+              )}
+
               {/* Generate Test Cases button - visible ONLY when feature-context generation has successfully completed */}
               {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
                 <button
@@ -537,6 +644,16 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Retrieved Code Inspection Modal */}
+      <RetrievedCodeModal
+        isOpen={retrievedCodeModal.isOpen}
+        onClose={() => setRetrievedCodeModal((prev) => ({ ...prev, isOpen: false }))}
+        files={retrievedCodeModal.files}
+        loading={retrievedCodeModal.loading}
+        onRefresh={handleRefreshRetrievedCode}
+        projectName={graphData?.projectName || ''}
+      />
     </div>
   );
 }

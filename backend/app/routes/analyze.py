@@ -13,6 +13,8 @@ from app.models.schemas import (
     FeatureContextResponse,
     UnitTestCaseRequest,
     UnitTestCaseResponse,
+    RetrievedCodeRequest,
+    RetrievedCodeResponse,
 )
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
@@ -293,4 +295,125 @@ async def create_unit_test_cases_endpoint(req: UnitTestCaseRequest):
     except Exception as exc:
         backend_logger.error(f"[UnitTestGenerator] Endpoint error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def get_existing_retrieved_code(code_map_source) -> list[Path]:
+    target_dir = None
+    if isinstance(code_map_source, (str, Path)):
+        p = Path(code_map_source)
+        if p.is_file():
+            target_dir = p.parent
+        elif p.is_dir():
+            target_dir = p
+    elif isinstance(code_map_source, dict):
+        cand = code_map_source.get("project", {}).get("codeMapPath") or code_map_source.get("codeMapPath")
+        if cand and Path(cand).exists():
+            target_dir = Path(cand).parent
+
+    if not target_dir:
+        return []
+
+    retrieved_dir = target_dir / "code retrieved"
+    if not retrieved_dir.exists() or not retrieved_dir.is_dir():
+        return []
+
+    return [f for f in retrieved_dir.glob("*.json") if f.is_file()]
+
+
+@router.get("/api/retrieved-code", response_model=RetrievedCodeResponse)
+async def check_retrieved_code_endpoint(
+    codeMapPath: Optional[str] = None,
+    projectId: Optional[str] = None,
+):
+    code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    existing_files = get_existing_retrieved_code(code_map_source)
+    if existing_files:
+        files_data = []
+        for f in existing_files:
+            try:
+                import json
+                with open(f, "r", encoding="utf-8") as fp:
+                    files_data.append({"fileName": f.name, "filePath": str(f), "content": json.load(fp)})
+            except Exception:
+                pass
+        return RetrievedCodeResponse(
+            status="success",
+            alreadyExists=True,
+            retrievedCount=len(existing_files),
+            savedFiles=[f.name for f in existing_files],
+            files=files_data,
+            message=f"Found {len(existing_files)} retrieved code artifact(s).",
+        )
+    return RetrievedCodeResponse(
+        status="not_found",
+        alreadyExists=False,
+        retrievedCount=0,
+        savedFiles=[],
+        files=[],
+        message="No retrieved code found yet.",
+    )
+
+
+@router.post("/api/retrieve-code", response_model=RetrievedCodeResponse)
+async def trigger_retrieve_code_endpoint(req: RetrievedCodeRequest):
+    code_map_source = await _resolve_code_map_source(req.codeMapPath, req.projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    # Delegate to Local Agent at http://localhost:3001/agent/retrieve-code
+    import httpx
+    agent_url = "http://localhost:3001/agent/retrieve-code"
+    cm_path_str = str(code_map_source) if isinstance(code_map_source, (str, Path)) else None
+    payload = {"codeMapPath": cm_path_str, "projectId": req.projectId, "projectPath": req.projectPath}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(agent_url, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                existing_files = get_existing_retrieved_code(code_map_source)
+                files_data = []
+                for f in existing_files:
+                    try:
+                        import json
+                        with open(f, "r", encoding="utf-8") as fp:
+                            files_data.append({"fileName": f.name, "filePath": str(f), "content": json.load(fp)})
+                    except Exception:
+                        pass
+                return RetrievedCodeResponse(
+                    status="success",
+                    alreadyExists=True,
+                    retrievedCount=data.get("retrievedCount", len(existing_files)),
+                    savedFiles=data.get("savedFiles", [f.name for f in existing_files]),
+                    files=files_data,
+                    message=data.get("message", "Source code retrieved successfully."),
+                )
+    except Exception as exc:
+        backend_logger.warning(f"[RetrieveCode] Agent call failed: {exc}")
+
+    # Fallback if agent not reachable: check if files exist on disk
+    existing_files = get_existing_retrieved_code(code_map_source)
+    if existing_files:
+        files_data = []
+        for f in existing_files:
+            try:
+                import json
+                with open(f, "r", encoding="utf-8") as fp:
+                    files_data.append({"fileName": f.name, "filePath": str(f), "content": json.load(fp)})
+            except Exception:
+                pass
+        return RetrievedCodeResponse(
+            status="success",
+            alreadyExists=True,
+            retrievedCount=len(existing_files),
+            savedFiles=[f.name for f in existing_files],
+            files=files_data,
+            message="Retrieved code found on disk.",
+        )
+
+    raise HTTPException(status_code=502, detail="Local Agent code retrieval was unreachable or failed.")
+
 

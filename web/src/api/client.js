@@ -42,3 +42,27 @@ export const generateTestCases = (params) =>
     typeof params === 'string' ? { codeMapPath: params } : params
   );
 
+// Checks whether valid retrieved code files exist for the current project.
+export const checkRetrievedCode = async (params) => {
+  const query = typeof params === 'string' ? { codeMapPath: params } : params;
+  try {
+    const res = await agentApi.get('/agent/retrieved-code', { params: query });
+    if (res.data?.status === 'success') return res;
+  } catch (e) {
+    // Fall back to backend if agent direct call fails
+  }
+  return backendApi.get('/api/retrieved-code', { params: query });
+};
+
+// Triggers Code Retrieval Engine inside the Local Agent.
+export const retrieveCode = async (params) => {
+  const payload = typeof params === 'string' ? { codeMapPath: params } : params;
+  try {
+    const res = await agentApi.post('/agent/retrieve-code', payload);
+    if (res.data?.status === 'success') return res;
+  } catch (e) {
+    // Fall back to backend if agent direct call fails
+  }
+  return backendApi.post('/api/retrieve-code', payload);
+};
+
