@@ -175,7 +175,7 @@ function extractSufficientSource(rawContent, targetSymbol, symbolDecl, language)
     };
   }
 
-  const startLine = symbolDecl?.line ? Math.max(1, symbolDecl.line) : 1;
+  const startLine = Math.max(1, symbolDecl?.location?.startLine || symbolDecl?.line || symbolDecl?.startLine || 1);
   const symbolBlock = extractSymbolCodeBlock(lines, startLine, language);
   const blockLinesCount = symbolBlock.split(/\r?\n/).length;
   const endLine = startLine + blockLinesCount - 1;
@@ -281,9 +281,34 @@ async function retrieveCodeForProject(options = {}) {
   // In-memory index of codeMap files
   const filesIndex = new Map();
   const rawFiles = codeMap.files || {};
-  for (const [relPath, fileData] of Object.entries(rawFiles)) {
-    filesIndex.set(normalizePath(relPath), { relPath, ...fileData });
-    filesIndex.set(relPath.toLowerCase(), { relPath, ...fileData });
+  const addToFileIndex = (item, rawPath) => {
+    if (!rawPath) return;
+    const norm = normalizePath(rawPath);
+    filesIndex.set(norm, item);
+    filesIndex.set(norm.toLowerCase(), item);
+    filesIndex.set(rawPath.toLowerCase(), item);
+    const base = path.basename(rawPath);
+    if (!filesIndex.has(base)) filesIndex.set(base, item);
+    if (!filesIndex.has(base.toLowerCase())) filesIndex.set(base.toLowerCase(), item);
+  };
+
+  if (Array.isArray(rawFiles)) {
+    for (const fileData of rawFiles) {
+      const relPath = fileData.relativePath || fileData.file?.relativePath || fileData.path || fileData.file?.path || '';
+      const item = { relPath, ...fileData };
+      addToFileIndex(item, relPath);
+      if (fileData.file?.path) addToFileIndex(item, fileData.file.path);
+      if (fileData.file?.relativePath) addToFileIndex(item, fileData.file.relativePath);
+      if (fileData.file?.name) addToFileIndex(item, fileData.file.name);
+    }
+  } else {
+    for (const [relPath, fileData] of Object.entries(rawFiles)) {
+      const actualPath = fileData?.relativePath || fileData?.file?.relativePath || relPath;
+      const item = { relPath: actualPath, ...fileData };
+      addToFileIndex(item, actualPath);
+      if (fileData?.file?.relativePath) addToFileIndex(item, fileData.file.relativePath);
+      if (fileData?.file?.name) addToFileIndex(item, fileData.file.name);
+    }
   }
 
   // In-memory index of relationships
@@ -344,34 +369,45 @@ async function retrieveCodeForProject(options = {}) {
 
       // 1. Resolve target file in Code Map
       const normTargetFile = normalizePath(targetFileRaw);
+      const baseTargetFile = path.basename(targetFileRaw);
       const codeMapEntry =
         filesIndex.get(normTargetFile) ||
-        filesIndex.get(normTargetFile.toLowerCase());
+        filesIndex.get(normTargetFile.toLowerCase()) ||
+        filesIndex.get(targetFileRaw.toLowerCase()) ||
+        filesIndex.get(baseTargetFile) ||
+        filesIndex.get(baseTargetFile.toLowerCase());
 
       if (!codeMapEntry) {
         retrievalStatus = 'target_not_found';
         warnings.push(`Target file '${targetFileRaw}' not found in repository Code Map.`);
       }
 
-      // 2. Resolve target symbol in declarations
+      // 2. Resolve target symbol in declarations, symbols, and classes
       let symbolDecl = null;
       if (codeMapEntry && targetSymbol) {
-        const decls = codeMapEntry.declarations || [];
+        const decls = [
+          ...(codeMapEntry.declarations || []),
+          ...(codeMapEntry.symbols || []),
+          ...(codeMapEntry.classes || [])
+        ];
         symbolDecl = decls.find(
           (d) => d.name === targetSymbol || (d.name && d.name.toLowerCase() === targetSymbol.toLowerCase())
         );
 
         if (!symbolDecl) {
-          // Check methods inside classes
+          // Check methods/symbols inside parent classes or objects
           for (const d of decls) {
-            if (d.methods && Array.isArray(d.methods)) {
-              const methodMatch = d.methods.find(
-                (m) => m.name === targetSymbol || (m.name && m.name.toLowerCase() === targetSymbol.toLowerCase())
-              );
-              if (methodMatch) {
-                symbolDecl = { ...methodMatch, parentClass: d.name };
-                break;
-              }
+            const nested = [
+              ...(Array.isArray(d.methods) ? d.methods : []),
+              ...(Array.isArray(d.symbols) ? d.symbols : []),
+              ...(Array.isArray(d.functions) ? d.functions : [])
+            ];
+            const match = nested.find(
+              (m) => m.name === targetSymbol || (m.name && m.name.toLowerCase() === targetSymbol.toLowerCase())
+            );
+            if (match) {
+              symbolDecl = { ...match, parentClass: d.name };
+              break;
             }
           }
         }
@@ -387,9 +423,14 @@ async function retrieveCodeForProject(options = {}) {
       // 3. Retrieve actual source code from original project on disk
       const sourceFiles = [];
       let sourceRanges = [];
+      const effectiveRelPath = codeMapEntry?.relPath || codeMapEntry?.file?.relativePath || codeMapEntry?.file?.path || targetFileRaw;
+      const detectedLang = codeMapEntry?.language || codeMapEntry?.file?.language || codeMap.project?.languagesDetected?.[0] || '';
 
       if (codeMapEntry && originalProjectRoot) {
-        const diskPath = path.resolve(originalProjectRoot, codeMapEntry.relPath || targetFileRaw);
+        const diskPath = path.isAbsolute(effectiveRelPath)
+          ? effectiveRelPath
+          : path.resolve(originalProjectRoot, effectiveRelPath);
+
         if (fs.existsSync(diskPath)) {
           let fileContent = diskFileCache.get(diskPath);
           if (!fileContent) {
@@ -407,11 +448,11 @@ async function retrieveCodeForProject(options = {}) {
               fileContent,
               targetSymbol,
               symbolDecl,
-              codeMapEntry.language
+              detectedLang
             );
 
             sourceFiles.push({
-              path: normalizePath(codeMapEntry.relPath || targetFileRaw),
+              path: normalizePath(effectiveRelPath),
               reason: 'primary_target',
               symbol: targetSymbol || (symbolDecl ? symbolDecl.name : null),
               sourceCode: extracted.sourceCode
@@ -461,7 +502,7 @@ async function retrieveCodeForProject(options = {}) {
         },
         retrieval: {
           status: retrievalStatus,
-          primaryFile: codeMapEntry?.relPath || targetFileRaw,
+          primaryFile: effectiveRelPath,
           primarySymbol: targetSymbol || (symbolDecl ? symbolDecl.name : null),
           relatedFiles,
           relatedSymbols,
@@ -475,8 +516,8 @@ async function retrieveCodeForProject(options = {}) {
           relatedFiles,
           relatedSymbols,
           dependencyDepth,
-          language: codeMapEntry?.language || null,
-          lineCount: codeMapEntry?.lineCount || 0
+          language: detectedLang || null,
+          lineCount: codeMapEntry?.lineCount || codeMapEntry?.file?.lineCount || 0
         },
         warnings
       };

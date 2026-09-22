@@ -6,6 +6,7 @@ import GraphView from './components/GraphView';
 import NodeDetails from './components/NodeDetails';
 import EdgeDetails from './components/EdgeDetails';
 import RetrievedCodeModal from './components/RetrievedCodeModal';
+import TestScriptsModal from './components/TestScriptsModal';
 import {
   startAnalysis,
   getAgentStatus,
@@ -15,9 +16,11 @@ import {
   checkTestCases,
   generateTestCases,
   checkRetrievedCode,
-  retrieveCode
+  retrieveCode,
+  checkTestScripts,
+  generateTestScripts
 } from './api/client';
-import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2, TestTube2, Code2 } from 'lucide-react';
+import { Layers, PlusCircle, Sparkles, CheckCircle2, AlertCircle, Loader2, TestTube2, Code2, FileCode } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState('home'); // 'home' | 'analyzing' | 'graph'
@@ -36,11 +39,24 @@ export default function App() {
   // Unit Test Cases Generation state — idle | loading | already_exists | success | error
   const [testCasesState, setTestCasesState] = useState({ status: 'idle', step: 'idle', message: null, data: null });
 
+  // Code Retrieval state
+  const [hasRetrievedCode, setHasRetrievedCode] = useState(false);
+
   // Retrieved Code inspection modal state
   const [retrievedCodeModal, setRetrievedCodeModal] = useState({
     isOpen: false,
     loading: false,
     files: [],
+    error: null
+  });
+
+  // Test Scripts state & modal
+  const [testScriptsState, setTestScriptsState] = useState({ status: 'idle', message: null });
+  const [testScriptsModal, setTestScriptsModal] = useState({
+    isOpen: false,
+    loading: false,
+    scripts: [],
+    projectEnvironment: null,
     error: null
   });
 
@@ -137,6 +153,7 @@ export default function App() {
       // First check if retrieved code already exists
       const checkRes = await checkRetrievedCode({ codeMapPath, projectId });
       if (checkRes.data?.status === 'success' && checkRes.data.files?.length > 0) {
+        setHasRetrievedCode(true);
         setRetrievedCodeModal((prev) => ({
           ...prev,
           isOpen: true,
@@ -149,6 +166,7 @@ export default function App() {
       // If not yet retrieved, run retrieval engine
       const retrieveRes = await retrieveCode({ codeMapPath, projectId });
       if (retrieveRes.data?.status === 'success') {
+        setHasRetrievedCode(true);
         const filesRes = await checkRetrievedCode({ codeMapPath, projectId });
         setRetrievedCodeModal((prev) => ({
           ...prev,
@@ -182,6 +200,7 @@ export default function App() {
     setRetrievedCodeModal((prev) => ({ ...prev, loading: true, error: null }));
     try {
       await retrieveCode({ codeMapPath, projectId });
+      setHasRetrievedCode(true);
       const filesRes = await checkRetrievedCode({ codeMapPath, projectId });
       setRetrievedCodeModal((prev) => ({
         ...prev,
@@ -191,6 +210,56 @@ export default function App() {
     } catch (err) {
       console.error('[RetrievedCode] Refresh error:', err);
       setRetrievedCodeModal((prev) => ({ ...prev, loading: false }));
+    }
+  };
+
+  const handleGenerateOrOpenTestScripts = async (force = false) => {
+    const codeMapPath =
+      graphData?.codeMap?.project?.codeMapPath ||
+      graphData?.codeMap?.codeMapPath ||
+      null;
+
+    setTestScriptsModal((prev) => ({ ...prev, isOpen: true, loading: true, error: null }));
+    setTestScriptsState({ status: 'loading', message: 'Generating test scripts...' });
+
+    try {
+      if (!force) {
+        // First check existing test scripts
+        const checkRes = await checkTestScripts({ codeMapPath, projectId });
+        if (checkRes.data?.status === 'success' && checkRes.data?.scripts?.length > 0) {
+          setTestScriptsModal((prev) => ({
+            ...prev,
+            isOpen: true,
+            loading: false,
+            scripts: checkRes.data.scripts,
+            projectEnvironment: checkRes.data.projectEnvironment,
+          }));
+          setTestScriptsState({ status: 'success', message: `Found ${checkRes.data.scripts.length} test script(s).` });
+          return;
+        }
+      }
+
+      // Generate test scripts
+      const genRes = await generateTestScripts({ codeMapPath, projectId, force });
+      if (genRes.data?.status === 'success') {
+        const checkRes = await checkTestScripts({ codeMapPath, projectId });
+        setTestScriptsModal((prev) => ({
+          ...prev,
+          isOpen: true,
+          loading: false,
+          scripts: checkRes.data?.scripts || genRes.data.scripts || [],
+          projectEnvironment: genRes.data.projectEnvironment,
+        }));
+        setTestScriptsState({ status: 'success', message: genRes.data.message });
+      } else {
+        setTestScriptsModal((prev) => ({ ...prev, loading: false, error: genRes.data?.message }));
+        setTestScriptsState({ status: 'error', message: genRes.data?.message });
+      }
+    } catch (err) {
+      console.error('[TestScripts] Error:', err);
+      const errMsg = err.response?.data?.detail || err.message || 'Failed to generate test scripts';
+      setTestScriptsModal((prev) => ({ ...prev, loading: false, error: errMsg }));
+      setTestScriptsState({ status: 'error', message: errMsg });
     }
   };
 
@@ -392,6 +461,24 @@ export default function App() {
         setFeatureCtx({ status: 'idle', step: 'idle', message: null, data: null });
         setTestCasesState({ status: 'idle', step: 'idle', message: null, data: null });
       }
+
+      // Check existing retrieved code
+      try {
+        const rcRes = await checkRetrievedCode({ codeMapPath, projectId: pid });
+        if (rcRes.data?.status === 'success' && ((rcRes.data.files && rcRes.data.files.length > 0) || (rcRes.data.savedFiles && rcRes.data.savedFiles.length > 0))) {
+          setHasRetrievedCode(true);
+          try {
+            const tsRes = await checkTestScripts({ codeMapPath, projectId: pid });
+            if (tsRes.data?.status === 'success' && tsRes.data.scripts?.length > 0) {
+              setTestScriptsState({ status: 'success', message: `Found ${tsRes.data.scripts.length} test script(s).` });
+            }
+          } catch (e) {}
+        } else {
+          setHasRetrievedCode(false);
+        }
+      } catch (e) {
+        setHasRetrievedCode(false);
+      }
     } catch (e) {
       setError('Failed to load project graph');
     }
@@ -407,6 +494,9 @@ export default function App() {
     setGraphLookup(null);
     setFeatureCtx({ status: 'idle', message: null, data: null });
     setTestCasesState({ status: 'idle', message: null, data: null });
+    setHasRetrievedCode(false);
+    setTestScriptsState({ status: 'idle', message: null });
+    setTestScriptsModal({ isOpen: false, loading: false, scripts: [], projectEnvironment: null, error: null });
   };
 
   const handleNodeClick = (node, lookup) => {
@@ -451,6 +541,27 @@ export default function App() {
 
           {view === 'graph' && (
             <div className="flex items-center gap-3">
+              {/* GENERATE TEST SCRIPTS button - visible ONLY after Code Retrieval succeeds, placed immediately to the LEFT of Retrieved Code */}
+              {hasRetrievedCode && (
+                <button
+                  onClick={() => handleGenerateOrOpenTestScripts(false)}
+                  disabled={testScriptsState.status === 'loading'}
+                  className="flex items-center gap-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-purple-600 shadow-sm"
+                  title="Generate or view executable test scripts grounded in source code"
+                >
+                  {testScriptsState.status === 'loading' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <FileCode className="w-4 h-4" />
+                  )}
+                  {testScriptsState.status === 'loading'
+                    ? 'Generating Test Scripts...'
+                    : testScriptsState.status === 'success'
+                    ? 'View Test Scripts'
+                    : 'Generate Test Scripts'}
+                </button>
+              )}
+
               {/* Retrieved Code button - visible ONLY when test cases have been generated, placed immediately to the LEFT of Generated Test Cases */}
               {(testCasesState.status === 'success' || testCasesState.status === 'already_exists') && (
                 <button
@@ -652,6 +763,17 @@ export default function App() {
         files={retrievedCodeModal.files}
         loading={retrievedCodeModal.loading}
         onRefresh={handleRefreshRetrievedCode}
+        projectName={graphData?.projectName || ''}
+      />
+
+      {/* Generated Test Scripts Modal */}
+      <TestScriptsModal
+        isOpen={testScriptsModal.isOpen}
+        onClose={() => setTestScriptsModal((prev) => ({ ...prev, isOpen: false }))}
+        scripts={testScriptsModal.scripts}
+        projectEnv={testScriptsModal.projectEnvironment}
+        loading={testScriptsModal.loading}
+        onRefresh={() => handleGenerateOrOpenTestScripts(true)}
         projectName={graphData?.projectName || ''}
       />
     </div>

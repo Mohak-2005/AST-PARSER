@@ -66,3 +66,16 @@ export const retrieveCode = async (params) => {
   return backendApi.post('/api/retrieve-code', payload);
 };
 
+// Checks whether generated test scripts exist for the current project.
+export const checkTestScripts = (params) =>
+  backendApi.get('/api/test-scripts', {
+    params: typeof params === 'string' ? { codeMapPath: params } : params,
+  });
+
+// Triggers Dynamic Test Script Generation service for the current project.
+export const generateTestScripts = (params) =>
+  backendApi.post(
+    '/api/test-scripts',
+    typeof params === 'string' ? { codeMapPath: params } : params
+  );
+

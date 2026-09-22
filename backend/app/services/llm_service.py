@@ -9,6 +9,7 @@ from app.services.json_repair_service import (
     parse_json,
     repair_json_deterministically
 )
+from app.services.llm_provider import execute_provider_call, get_provider_config
 
 SYSTEM_PROMPT = """You are a code analysis assistant. You receive a structured Code Map of a software repository and generate a dependency graph representing ACTUAL APPLICATION SOURCE CODE ONLY.
 
@@ -203,133 +204,18 @@ async def _execute_openrouter_call(
     metrics_info: dict = None
 ) -> Tuple[str, int, float]:
     """
-    Reusable asynchronous OpenRouter caller sharing exact timeout and headers.
+    Unified LLM caller delegating dynamically to the configured provider (Groq, HF, Mistral, Gemini).
+    Maintained for full backward compatibility with existing tests and callers.
     """
-    headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5000",
-        "X-Title": "AST Dependency Graph Analyzer"
-    }
-
-    payload = {
-        "model": settings.openrouter_model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens
-    }
-
-    timeout = httpx.Timeout(
-        connect=settings.llm_connect_timeout,
-        read=settings.llm_read_timeout,
-        write=settings.llm_write_timeout,
-        pool=settings.llm_pool_timeout
+    return await execute_provider_call(
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        analysis_id=analysis_id,
+        stage_name=stage_name,
+        attempt=attempt,
+        metrics_info=metrics_info
     )
-
-    t0 = time.time()
-    status_code = 0
-    raw_content = ""
-
-    backend_logger.info(f"LLM HTTP request started [{stage_name}] attempt={attempt}")
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            response = await client.post(
-                f"{settings.openrouter_base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            status_code = response.status_code
-            response.raise_for_status()
-            data = response.json()
-            raw_content = data["choices"][0]["message"]["content"]
-        except httpx.TimeoutException as exc:
-            duration_s = time.time() - t0
-            err_msg = f"OpenRouter LLM request timed out after {duration_s:.2f}s (configured read timeout: {settings.llm_read_timeout}s)"
-            backend_logger.error(err_msg)
-            log_stage(stage_name, "FAILURE", message=err_msg, analysis_id=analysis_id, duration_ms=duration_s * 1000)
-            log_error(stage_name, "TimeoutException", err_msg, stack_trace=str(exc), analysis_id=analysis_id)
-            if metrics_info:
-                log_llm_metrics(
-                    analysis_id=analysis_id,
-                    model=settings.openrouter_model,
-                    file_count=metrics_info.get("file_count", 0),
-                    code_map_bytes=metrics_info.get("code_map_bytes", 0),
-                    prompt_chars=metrics_info.get("prompt_chars", 0),
-                    start_time=t0,
-                    end_time=time.time(),
-                    duration_s=duration_s,
-                    status_code=408,
-                    success=False,
-                    error_type="TimeoutException",
-                    error_message=err_msg
-                )
-            raise TimeoutError(err_msg) from exc
-        except httpx.HTTPStatusError as exc:
-            duration_s = time.time() - t0
-            status_code = exc.response.status_code
-            err_body = exc.response.text[:300] if exc.response.text else ""
-            err_msg = f"OpenRouter returned HTTP {status_code}: {err_body}"
-            backend_logger.error(err_msg)
-            log_stage(stage_name, "FAILURE", message=err_msg, analysis_id=analysis_id, duration_ms=duration_s * 1000)
-            log_error(stage_name, "HTTPStatusError", err_msg, analysis_id=analysis_id)
-            if metrics_info:
-                log_llm_metrics(
-                    analysis_id=analysis_id,
-                    model=settings.openrouter_model,
-                    file_count=metrics_info.get("file_count", 0),
-                    code_map_bytes=metrics_info.get("code_map_bytes", 0),
-                    prompt_chars=metrics_info.get("prompt_chars", 0),
-                    start_time=t0,
-                    end_time=time.time(),
-                    duration_s=duration_s,
-                    status_code=status_code,
-                    success=False,
-                    error_type="HTTPStatusError",
-                    error_message=err_msg
-                )
-            raise RuntimeError(err_msg) from exc
-        except httpx.HTTPError as exc:
-            duration_s = time.time() - t0
-            err_msg = f"OpenRouter network error: {str(exc)}"
-            backend_logger.error(err_msg)
-            log_stage(stage_name, "FAILURE", message=err_msg, analysis_id=analysis_id, duration_ms=duration_s * 1000)
-            log_error(stage_name, type(exc).__name__, err_msg, analysis_id=analysis_id)
-            if metrics_info:
-                log_llm_metrics(
-                    analysis_id=analysis_id,
-                    model=settings.openrouter_model,
-                    file_count=metrics_info.get("file_count", 0),
-                    code_map_bytes=metrics_info.get("code_map_bytes", 0),
-                    prompt_chars=metrics_info.get("prompt_chars", 0),
-                    start_time=t0,
-                    end_time=time.time(),
-                    duration_s=duration_s,
-                    status_code=status_code or 502,
-                    success=False,
-                    error_type=type(exc).__name__,
-                    error_message=err_msg
-                )
-            raise RuntimeError(err_msg) from exc
-
-    duration_s = time.time() - t0
-    backend_logger.info(f"LLM HTTP response received [{stage_name}] in {duration_s:.2f}s")
-    log_stage(stage_name, "RESPONSE_RECEIVED", analysis_id=analysis_id, duration_ms=duration_s * 1000, extra={"attempt": attempt})
-    
-    if metrics_info:
-        log_llm_metrics(
-            analysis_id=analysis_id,
-            model=settings.openrouter_model,
-            file_count=metrics_info.get("file_count", 0),
-            code_map_bytes=metrics_info.get("code_map_bytes", 0),
-            prompt_chars=metrics_info.get("prompt_chars", 0),
-            start_time=t0,
-            end_time=time.time(),
-            duration_s=duration_s,
-            status_code=status_code,
-            success=True
-        )
-
-    return raw_content, status_code, duration_s
 
 
 def parse_and_recover_json(
@@ -508,20 +394,23 @@ async def generate_dependency_graph(code_map: dict, analysis_id: str = None) -> 
         log_error("LLM_REQUEST", "RepositorySizeLimitExceeded", err_msg, analysis_id=analysis_id)
         raise ValueError(err_msg)
 
-    # 2. Required logging before OpenRouter request (NO API KEY LENGTH LOGGED)
-    key_loaded = bool(settings.openrouter_api_key and settings.openrouter_api_key != "your_openrouter_api_key")
+    # 2. Required logging before LLM request (NO API KEY LENGTH LOGGED)
+    cfg = get_provider_config(require_api_key=False)
+    key_loaded = bool(cfg.api_key)
 
     backend_logger.info(f"CODE MAP FILE COUNT: {file_count}")
     backend_logger.info(f"PROMPT CHARACTER COUNT: {prompt_chars}")
-    backend_logger.info(f"MODEL USED: {settings.openrouter_model}")
-    backend_logger.info(f"BASE URL USED: {settings.openrouter_base_url}")
+    backend_logger.info(f"LLM PROVIDER: {cfg.name}")
+    backend_logger.info(f"MODEL USED: {cfg.model}")
+    backend_logger.info(f"BASE URL USED: {cfg.base_url}")
     backend_logger.info(f"API KEY LOADED: {key_loaded}")
 
     backend_logger.info("LLM REQUEST STARTED")
     log_stage("LLM_REQUEST", "START", analysis_id=analysis_id, extra={
         "file_count": file_count,
         "prompt_chars": prompt_chars,
-        "model": settings.openrouter_model
+        "provider": cfg.name,
+        "model": cfg.model
     })
 
     metrics_info = {
@@ -647,5 +536,6 @@ async def generate_dependency_graph(code_map: dict, analysis_id: str = None) -> 
     raise ValueError(final_err_msg)
 
 
-# Explicit Hugging Face caller export for project-wide LLM tasks
+# Unified provider caller exports for project-wide LLM tasks
 execute_hf_llm_call = _execute_openrouter_call
+execute_llm_call = execute_provider_call

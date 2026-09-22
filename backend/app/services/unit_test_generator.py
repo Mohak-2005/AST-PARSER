@@ -39,6 +39,19 @@ from app.services.feature_context_generator import (
     load_code_map,
     sanitize_filename,
 )
+from app.services.context_selector import (
+    select_context_for_test_case,
+    build_grounded_test_prompt,
+    resolve_test_type,
+    resolve_target,
+    extract_actual_source_code,
+    resolve_project_root,
+    find_source_file_on_disk,
+)
+from app.services.llm_provider import (
+    get_active_provider_name,
+    get_provider_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -418,36 +431,44 @@ def group_units_for_generation(
 # Focused Context Construction
 # ---------------------------------------------------------------------------
 
-def _read_source_snippet_if_available(file_path: str, code_map_path: Optional[Path], line: Optional[int]) -> Optional[str]:
+def _read_source_snippet_if_available(
+    file_path: str,
+    code_map_path: Optional[Path],
+    line: Optional[int],
+    project_root: Optional[Path] = None,
+    code_map: Optional[dict] = None
+) -> Optional[str]:
     """Safely extracts a small line snippet (up to 30 lines) if the source file is on disk."""
-    if not code_map_path or not line:
+    if not line:
         return None
 
-    # Check project directory containing code_map_path
-    candidate_paths = [
-        code_map_path.parent / file_path,
-        Path(file_path),
-    ]
+    disk_path = find_source_file_on_disk(
+        file_rel_path=file_path,
+        project_root=project_root,
+        code_map_path=code_map_path,
+        code_map=code_map
+    )
+    if not disk_path or not disk_path.exists():
+        return None
 
-    for p in candidate_paths:
-        try:
-            if p.exists() and p.is_file():
-                with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                    lines = fh.readlines()
-                    start = max(0, line - 2)
-                    end = min(len(lines), line + 28)
-                    snippet = "".join(lines[start:end]).strip()
-                    if snippet:
-                        return snippet[:1200]
-        except Exception:
-            pass
+    try:
+        with open(disk_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+            start = max(0, line - 2)
+            end = min(len(lines), line + 28)
+            snippet = "".join(lines[start:end]).strip()
+            if snippet:
+                return snippet[:1200]
+    except Exception:
+        pass
     return None
 
 
 def build_focused_unit_context(
     group: dict,
     code_map: dict,
-    code_map_path: Optional[Path] = None
+    code_map_path: Optional[Path] = None,
+    project_root: Optional[Path] = None
 ) -> dict:
     """
     Constructs a tightly focused context containing ONLY information relevant to the group's units:
@@ -459,6 +480,7 @@ def build_focused_unit_context(
     - Implementation snippet (if source is accessible)
     Never sends the entire repository or entire code map.
     """
+    resolved_root = resolve_project_root(code_map, code_map_path, project_root)
     files_dict = code_map.get("files", {})
     all_relationships = code_map.get("relationships", [])
     group_files = set(group["files"])
@@ -493,10 +515,25 @@ def build_focused_unit_context(
             if u.get("container"):
                 usum["container"] = u["container"]
 
-            # Attach exact snippet if source is available
-            snippet = _read_source_snippet_if_available(fp, code_map_path, u.get("line"))
-            if snippet:
-                usum["codeSnippet"] = snippet
+            # Attach authoritative source code snippet if available on disk
+            s_status, s_data = extract_actual_source_code(
+                file_rel_path=fp,
+                target_symbol=u.get("symbol"),
+                decl_line=u.get("line"),
+                language=fdata.get("language") or "",
+                code_map_path=code_map_path,
+                project_root=resolved_root,
+                code_map=code_map
+            )
+            if s_data and s_data.get("sourceCode"):
+                usum["codeSnippet"] = s_data["sourceCode"]
+            else:
+                snippet = _read_source_snippet_if_available(
+                    fp, code_map_path, u.get("line"),
+                    project_root=resolved_root, code_map=code_map
+                )
+                if snippet:
+                    usum["codeSnippet"] = snippet
 
             unit_summaries.append(usum)
 
@@ -529,6 +566,18 @@ def build_focused_unit_context(
             "description": fc.get("feature", {}).get("description"),
             "flow": fc.get("featureFlow", [])[:3]
         }
+
+    # Dynamically select minimal context for the group's primary target
+    first_u = group["units"][0] if group.get("units") else {}
+    if first_u:
+        focused["dynamicContext"] = select_context_for_test_case(
+            target={"file": first_u.get("file"), "symbol": first_u.get("symbol"), "type": first_u.get("type"), "line": first_u.get("line")},
+            test_type="unit",
+            code_map=code_map,
+            code_map_path=code_map_path,
+            project_root=resolved_root,
+            feature_contexts={fc["id"]: group["featureContext"]} if (group.get("featureContext") and "id" in group["featureContext"]) else None
+        )
 
     return focused
 
@@ -567,16 +616,38 @@ def build_generation_messages(focused_context: dict) -> list:
     system_content = (
         "You are an expert software verification engineer specializing in UNIT TESTING.\n\n"
         "Your task is to generate structured UNIT TEST CASE SPECIFICATIONS based ONLY on the provided code evidence.\n\n"
-        "STRICT RULES — READ CAREFULLY:\n"
+        "============================================================\n"
+        "SOURCE-GROUNDING GUARDRAILS (CRITICAL)\n"
+        "============================================================\n"
         "1. ONLY UNIT TEST CASES are permitted. Every test case MUST have 'testType': 'unit'.\n"
-        "2. DO NOT generate integration tests, API tests, E2E tests, UI tests, database tests, or system workflows.\n"
-        "3. DO NOT generate executable test scripts or test implementation code (no jest, pytest, junit scripts).\n"
-        "4. Every test case must test ONLY one of the specified units in complete isolation.\n"
-        "5. If a unit interacts with an external dependency or file, specify a MOCK/STUB in preconditions or inputs.\n"
-        "6. Scenarios must reflect ONLY behaviors supported by the provided evidence (normal behavior, valid inputs, boundary conditions, error handling).\n"
-        "7. DO NOT invent requirements, parameters, exceptions, or business rules not supported by the evidence.\n"
-        "8. Every 'symbol' and 'file' under 'unit' MUST exactly match the provided unit targets.\n"
-        "9. Return ONLY valid JSON matching the schema below. No markdown, no prose."
+        "2. NEVER infer behavior from a function, class, method, route, or component name alone. A symbol name is only an identifier/location signal, NOT evidence of behavior.\n"
+        "3. ACTUAL SOURCE CODE is authoritative. All assertions, branches, and expected results MUST be grounded in the provided implementation source code.\n"
+        "4. DO NOT invent: parameters, parameter names, parameter types, return types, return values, database operations, API calls, validation rules, error handling, side effects, state changes, UI behavior, business rules, file operations, authentication behavior, authorization behavior unless supported by the provided evidence.\n"
+        "5. DO NOT infer an operation merely because its name suggests it (e.g. 'delete_transaction' does NOT prove that the function deletes a database record).\n"
+        "6. DO NOT infer return types from naming conventions (e.g. 'get_categories' does NOT automatically mean the function returns a list).\n"
+        "7. DO NOT invent test inputs. Inputs must be derived from actual function parameters, actual source behavior, explicit Test Case information, or relevant structural metadata.\n"
+        "8. DO NOT invent database schemas, table names, columns, API endpoints, routes, or external services.\n"
+        "9. If the source shows a behavior that contradicts the Test Case intent, DO NOT silently accept the Test Case assumption. The generated Test Case must reflect the ACTUAL IMPLEMENTATION.\n"
+        "10. If sufficient evidence does not exist to determine a behavior: DO NOT GUESS. Either omit that behavioral claim or mark the case as requiring additional context.\n"
+        "11. Every test case must test ONLY one of the specified units in complete isolation.\n"
+        "12. If a unit interacts with an external dependency or file, specify a MOCK/STUB in preconditions or inputs.\n"
+        "13. DO NOT generate integration tests, API tests, E2E tests, UI tests, database tests, or system workflows.\n"
+        "14. DO NOT generate executable test scripts or test implementation code (no jest, pytest, junit scripts).\n"
+        "15. Every 'symbol' and 'file' under 'unit' MUST exactly match the provided unit targets.\n\n"
+        "============================================================\n"
+        "EVIDENCE HIERARCHY\n"
+        "============================================================\n"
+        "1. Actual source code\n"
+        "2. Explicit Test Case information\n"
+        "3. repository-code-map.json\n"
+        "4. Validated Dependency Graph\n"
+        "5. Feature Context\n"
+        "6. General programming conventions (MUST NEVER OVERRIDE PROJECT-SPECIFIC EVIDENCE)\n\n"
+        "============================================================\n"
+        "FINAL RULE\n"
+        "============================================================\n"
+        "GENERATE TEST CASES FROM EVIDENCE, NOT FROM NAMES.\n"
+        "Return ONLY valid JSON matching the schema below. No markdown, no prose."
     )
 
     user_content = (
@@ -643,37 +714,48 @@ FORBIDDEN_TEST_TERMS = {
 def validate_test_cases(
     raw_cases: list,
     valid_units_by_file: Dict[str, Set[str]],
-    code_map: dict
+    code_map: dict,
+    expected_test_type: Optional[str] = "unit"
 ) -> List[dict]:
     """
-    Deterministically validates test cases against all 10 criteria:
+    Deterministically validates test cases against criteria:
     1. Valid JSON (already parsed)
     2. Required fields exist
-    3. testType is strictly 'unit'
+    3. testType matches expected_test_type (defaults to 'unit')
     4. Referenced file exists in repository-code-map.json
     5. Referenced symbol exists in analyzed declarations
     6. Test cases correspond to a selected unit
     7. Duplicate test cases are removed
-    8. No integration/API/E2E/UI test cases
+    8. Rejects forbidden terms when expected_test_type is 'unit'
     9. No fabricated symbols
     10. Output conforms to schema
     """
     available_files = set(code_map.get("files", {}).keys())
     validated: List[dict] = []
     seen_signatures: Set[str] = set()
+    norm_expected_type = expected_test_type.strip().lower() if expected_test_type else None
 
     for idx, tc in enumerate(raw_cases):
         if not isinstance(tc, dict):
             continue
 
-        # 3. testType MUST be 'unit'
+        # 3. testType validation
         test_type = str(tc.get("testType", "")).strip().lower()
-        if test_type != "unit":
-            backend_logger.warning(f"[UnitTestGenerator] Rejecting non-unit test: {tc.get('title')} ({test_type})")
+        if norm_expected_type == "unit":
+            if test_type != "unit":
+                backend_logger.warning(f"[UnitTestGenerator] Rejecting non-unit test: {tc.get('title')} ({test_type})")
+                continue
+        elif norm_expected_type in ("integration", "functional", "e2e"):
+            if test_type != norm_expected_type:
+                # allow functional/e2e equivalence
+                if not (norm_expected_type in ("functional", "e2e") and test_type in ("functional", "e2e")):
+                    backend_logger.warning(f"[UnitTestGenerator] Rejecting mismatch test type: {tc.get('title')} ({test_type} != {norm_expected_type})")
+                    continue
+        elif norm_expected_type is not None and test_type != norm_expected_type:
             continue
 
         # 2. Required fields
-        unit_info = tc.get("unit")
+        unit_info = tc.get("unit") or tc.get("target")
         if not isinstance(unit_info, dict):
             continue
 
@@ -705,11 +787,12 @@ def validate_test_cases(
             backend_logger.warning(f"[UnitTestGenerator] Rejecting fabricated symbol: {symbol_ref} in {file_ref}")
             continue
 
-        # 8. Check for forbidden integration / E2E / UI terms
-        text_to_check = f"{title} {desc}".lower()
-        if any(term in text_to_check for term in FORBIDDEN_TEST_TERMS):
-            backend_logger.warning(f"[UnitTestGenerator] Rejecting integration/E2E test: {title}")
-            continue
+        # 8. Check for forbidden integration / E2E / UI terms if unit test
+        if norm_expected_type == "unit":
+            text_to_check = f"{title} {desc}".lower()
+            if any(term in text_to_check for term in FORBIDDEN_TEST_TERMS):
+                backend_logger.warning(f"[UnitTestGenerator] Rejecting integration/E2E test: {title}")
+                continue
 
         # 7. Deduplication
         inputs_str = json.dumps(inputs, sort_keys=True) if isinstance(inputs, (dict, list)) else str(inputs)
@@ -836,6 +919,8 @@ async def generate_all_unit_test_cases(
     if not code_map or not code_map.get("files"):
         raise ValueError("repository-code-map.json is missing or contains no files.")
 
+    resolved_project_root = resolve_project_root(code_map, code_map_path)
+
     # 3. Ingest existing feature contexts (supplementary semantic context)
     feature_contexts = load_existing_feature_contexts(code_map_path) if code_map_path else {}
     file_to_features = map_files_to_features(feature_contexts)
@@ -864,11 +949,25 @@ async def generate_all_unit_test_cases(
     all_saved_files: List[Path] = []
     total_test_cases = 0
     existing_filenames: Set[str] = set()
+    generation_failures: List[str] = []
 
     for group in groups:
-        focused = build_focused_unit_context(group, code_map, code_map_path)
-        raw_test_cases = await generate_test_cases_for_group(focused)
+        focused = build_focused_unit_context(group, code_map, code_map_path, project_root=resolved_project_root)
+        try:
+            raw_test_cases = await generate_test_cases_for_group(focused)
+        except Exception as exc:
+            err_str = str(exc)
+            generation_failures.append(f"Group '{group['name']}' API call failed: {err_str}")
+            backend_logger.error(f"[UnitTestGenerator] Group '{group['name']}' generation error: {err_str}")
+            raw_test_cases = []
+
+        if not raw_test_cases:
+            generation_failures.append(f"Group '{group['name']}' returned no parsed test cases")
+            continue
+
         validated = validate_test_cases(raw_test_cases, valid_units_by_file, code_map)
+        if not validated:
+            generation_failures.append(f"Group '{group['name']}' test cases rejected by validation")
 
         if validated and code_map_path:
             out_file = save_test_cases(code_map_path, group["name"], validated, existing_filenames)
@@ -876,7 +975,15 @@ async def generate_all_unit_test_cases(
             total_test_cases += len(validated)
 
     if not all_saved_files and not total_test_cases:
-        raise ValueError("Hugging Face model generation did not produce valid unit test cases.")
+        active_provider = get_active_provider_name()
+        try:
+            pcfg = get_provider_config(active_provider, require_api_key=False)
+            model_name = pcfg.get("model", "unknown")
+        except Exception:
+            model_name = "unknown"
+
+        detail_suffix = f": {'; '.join(set(generation_failures))}" if generation_failures else ""
+        raise ValueError(f"LLM provider {active_provider} ({model_name}) did not produce valid unit test cases{detail_suffix}.")
 
     return {
         "status": "success",
@@ -885,6 +992,119 @@ async def generate_all_unit_test_cases(
         "testCaseCount": total_test_cases,
         "unitCount": len(units),
         "message": f"Unit test cases generated successfully ({total_test_cases} test cases across {len(all_saved_files)} file(s)).",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Test-Type Test Case Generation
+# ---------------------------------------------------------------------------
+
+async def generate_test_cases_with_dynamic_context(
+    code_map_source: Union[str, Path, dict],
+    target: dict,
+    test_type: Optional[str] = None,
+    test_case: Optional[dict] = None,
+    graph_data: Optional[dict] = None,
+    feature_contexts: Optional[Dict[str, dict]] = None,
+    schema_spec: Optional[dict] = None
+) -> Dict[str, Any]:
+    """
+    Generates test cases using dynamic, test-type-aware minimum context selection.
+    Prioritizes actual source code as authoritative, enforces non-hallucination,
+    and returns validated test cases matching the required schema.
+    """
+    code_map, code_map_path = load_code_map(code_map_source)
+    if not code_map or not code_map.get("files"):
+        raise ValueError("repository-code-map.json is missing or contains no files.")
+
+    # Load feature contexts if not explicitly provided
+    if feature_contexts is None and code_map_path:
+        feature_contexts = load_existing_feature_contexts(code_map_path)
+
+    resolved_project_root = resolve_project_root(code_map, code_map_path)
+
+    # 1. Dynamically select compact grounded context
+    compact_context = select_context_for_test_case(
+        test_case=test_case,
+        target=target,
+        test_type=test_type,
+        code_map=code_map,
+        code_map_path=code_map_path,
+        project_root=resolved_project_root,
+        graph_data=graph_data,
+        feature_contexts=feature_contexts
+    )
+
+    # If target not found, DO NOT GUESS: Return structured failure state
+    res_status = compact_context.get("resolutionStatus")
+    if res_status in ("TARGET_NOT_FOUND", "INSUFFICIENT_CONTEXT"):
+        backend_logger.warning(f"[ContextSelector] Generation aborted: {res_status} for target {target}")
+        return {
+            "status": res_status,
+            "testCases": [],
+            "warnings": compact_context.get("warnings", []),
+            "context": compact_context
+        }
+
+    # 2. Build grounded prompt emphasizing source code authority
+    messages = build_grounded_test_prompt(compact_context, schema_spec)
+
+    # 3. Call LLM
+    raw_content, _, _ = await execute_hf_llm_call(
+        messages=messages,
+        max_tokens=3000,
+        temperature=0.1,
+        stage_name=f"{compact_context['testType'].upper()}_TEST_GENERATION"
+    )
+
+    # 4. Parse response
+    cleaned = strip_markdown_fences(raw_content)
+    ok, parsed, _ = parse_json(cleaned)
+    if not ok or not isinstance(parsed, dict) or "testCases" not in parsed:
+        rep_ok, rep_data, _, _ = repair_json_deterministically(cleaned)
+        if rep_ok and isinstance(rep_data, dict) and "testCases" in rep_data:
+            parsed = rep_data
+        elif rep_ok and isinstance(rep_data, list):
+            parsed = {"testCases": rep_data}
+        else:
+            backend_logger.warning("[UnitTestGenerator] Dynamic LLM output was not valid JSON.")
+            return {
+                "status": "RETRIEVAL_ERROR",
+                "testCases": [],
+                "warnings": ["LLM response was not valid JSON"],
+                "context": compact_context
+            }
+
+    raw_cases = parsed.get("testCases", [])
+
+    # 5. Deterministic Validation
+    # Build lookup of allowed symbols per file
+    valid_units = discover_testable_units(code_map)
+    valid_units_by_file: Dict[str, Set[str]] = defaultdict(set)
+    for u in valid_units:
+        valid_units_by_file[u["file"]].add(u["symbol"])
+        if u.get("methodName"):
+            valid_units_by_file[u["file"]].add(u["methodName"])
+        if u.get("container"):
+            valid_units_by_file[u["file"]].add(u["container"])
+
+    # If target has a symbol, ensure target symbol is allowed
+    resolved_t = compact_context.get("target", {})
+    if resolved_t.get("file") and resolved_t.get("symbol"):
+        valid_units_by_file[resolved_t["file"]].add(resolved_t["symbol"])
+
+    validated = validate_test_cases(
+        raw_cases=raw_cases,
+        valid_units_by_file=valid_units_by_file,
+        code_map=code_map,
+        expected_test_type=compact_context["testType"]
+    )
+
+    return {
+        "status": "SUCCESS" if validated else "INSUFFICIENT_CONTEXT",
+        "testCases": validated,
+        "warnings": compact_context.get("warnings", []),
+        "context": compact_context
     }
 
 

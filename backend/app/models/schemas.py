@@ -164,3 +164,21 @@ class RetrievedCodeResponse(BaseModel):
     message: str = ""
     alreadyExists: bool = False
 
+
+class TestScriptRequest(BaseModel):
+    codeMapPath: Optional[str] = None
+    projectId: Optional[str] = None
+    force: Optional[bool] = False
+
+
+class TestScriptResponse(BaseModel):
+    status: str
+    generatedCount: int = 0
+    successfulCount: int = 0
+    failedCount: int = 0
+    scriptsDir: Optional[str] = None
+    projectEnvironment: Optional[dict] = None
+    scripts: list[dict] = []
+    message: str = ""
+    alreadyExists: bool = False
+

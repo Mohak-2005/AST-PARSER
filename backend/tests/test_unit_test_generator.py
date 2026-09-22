@@ -405,6 +405,23 @@ class TestUnitTestGenerator(unittest.TestCase):
         import asyncio
         asyncio.run(self._test_pipeline_async())
 
+    async def _test_pipeline_failure_provider_aware_async(self):
+        # When LLM returns invalid JSON or empty testCases
+        with patch("app.services.unit_test_generator.execute_hf_llm_call", new_callable=AsyncMock) as mock_hf, \
+             patch("app.services.unit_test_generator.get_active_provider_name", return_value="groq"), \
+             patch("app.services.unit_test_generator.get_provider_config", return_value={"model": "openai/gpt-oss-120b"}):
+            mock_hf.return_value = ("not a json", 200, 0.5)
+            with self.assertRaises(ValueError) as ctx:
+                await generate_all_unit_test_cases(self.code_map_file, force=True)
+
+            err_msg = str(ctx.exception)
+            self.assertIn("LLM provider groq (openai/gpt-oss-120b)", err_msg)
+            self.assertNotIn("Hugging Face model generation", err_msg)
+
+    def test_pipeline_failure_provider_aware(self):
+        import asyncio
+        asyncio.run(self._test_pipeline_failure_provider_aware_async())
+
     # -----------------------------------------------------------------------
     # 10. FastAPI Endpoints (GET and POST /api/test-cases)
     # -----------------------------------------------------------------------

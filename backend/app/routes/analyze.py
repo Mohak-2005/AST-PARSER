@@ -1,3 +1,5 @@
+import os
+import json
 import time
 import uuid
 import traceback
@@ -5,6 +7,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional, Union
 from fastapi import APIRouter, HTTPException
+from app.config import settings, BACKEND_DIR
 from app.models.schemas import (
     CodeMapPayload,
     AnalyzeResponse,
@@ -15,6 +18,8 @@ from app.models.schemas import (
     UnitTestCaseResponse,
     RetrievedCodeRequest,
     RetrievedCodeResponse,
+    TestScriptRequest,
+    TestScriptResponse,
 )
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
@@ -26,6 +31,10 @@ from app.services.feature_context_generator import (
 from app.services.unit_test_generator import (
     generate_all_unit_test_cases,
     get_existing_test_cases,
+)
+from app.services.test_script_generator import (
+    generate_all_test_scripts,
+    get_existing_test_scripts,
 )
 from app.logger import backend_logger, log_stage, log_error
 
@@ -152,23 +161,174 @@ async def analyze(payload: CodeMapPayload):
     return AnalyzeResponse(projectId=project_id, graph=graph, message="Analysis complete")
 
 
+def _find_code_map_on_disk(
+    project_name: Optional[str],
+    project_path: Optional[str],
+    project_id: Optional[str],
+    candidate_path: Optional[str] = None,
+) -> Optional[str]:
+    # 1. Candidate path (e.g. from codeMap.project.codeMapPath or directly passed)
+    if candidate_path:
+        cand = Path(candidate_path)
+        if cand.is_file():
+            return str(cand.resolve())
+        elif (cand / "repository-code-map.json").is_file():
+            return str((cand / "repository-code-map.json").resolve())
+
+    # 2. In project directory itself
+    if project_path:
+        p_dir = Path(project_path)
+        if (p_dir / "repository-code-map.json").is_file():
+            return str((p_dir / "repository-code-map.json").resolve())
+        elif p_dir.is_file() and p_dir.name == "repository-code-map.json":
+            return str(p_dir.resolve())
+
+    # 3. Base output directories discovery
+    base_dirs: list[Path] = []
+    if getattr(settings, "analysis_output_dir", None):
+        base_dirs.append(Path(settings.analysis_output_dir))
+    env_out = os.environ.get("ANALYSIS_OUTPUT_DIR")
+    if env_out and Path(env_out) not in base_dirs:
+        base_dirs.append(Path(env_out))
+
+    # Fallback: check agent/.env if not already discovered
+    try:
+        agent_env = BACKEND_DIR.parent / "agent" / ".env"
+        if agent_env.is_file():
+            with open(agent_env, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("ANALYSIS_OUTPUT_DIR="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val and Path(val) not in base_dirs:
+                            base_dirs.append(Path(val))
+    except Exception:
+        pass
+
+    # Search in discovered base directories
+    for base_dir in base_dirs:
+        if not base_dir.is_dir():
+            continue
+
+        # Fast direct check: project_name folder
+        if project_name:
+            cand1 = base_dir / project_name / "repository-code-map.json"
+            if cand1.is_file():
+                return str(cand1.resolve())
+
+        # Fast direct check: project_path folder name
+        if project_path:
+            folder_name = Path(project_path).name
+            if folder_name:
+                cand2 = base_dir / folder_name / "repository-code-map.json"
+                if cand2.is_file():
+                    return str(cand2.resolve())
+
+        # Scan subdirectories with matching heuristics (bounded to immediate subdirs)
+        try:
+            for sub_dir in base_dir.iterdir():
+                if not sub_dir.is_dir():
+                    continue
+                map_file = sub_dir / "repository-code-map.json"
+                if not map_file.is_file():
+                    continue
+
+                # Case-insensitive name match
+                if project_name and sub_dir.name.lower() == project_name.lower():
+                    return str(map_file.resolve())
+                if project_path and sub_dir.name.lower() == Path(project_path).name.lower():
+                    return str(map_file.resolve())
+
+                # Deep inspection of code-map metadata
+                try:
+                    with open(map_file, "r", encoding="utf-8") as fh:
+                        cm_data = json.load(fh)
+                    proj_meta = cm_data.get("project", {}) if isinstance(cm_data, dict) else {}
+                    if not isinstance(proj_meta, dict):
+                        proj_meta = {}
+
+                    if project_id and (
+                        cm_data.get("analysis_id") == project_id
+                        or proj_meta.get("analysis_id") == project_id
+                        or proj_meta.get("projectId") == project_id
+                        or proj_meta.get("id") == project_id
+                    ):
+                        return str(map_file.resolve())
+
+                    if project_path:
+                        m_path = proj_meta.get("path")
+                        if m_path and (m_path == project_path or Path(m_path).resolve() == Path(project_path).resolve()):
+                            return str(map_file.resolve())
+
+                    if project_name and proj_meta.get("name") == project_name:
+                        return str(map_file.resolve())
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return None
+
+
 async def _resolve_code_map_source(code_map_path: Optional[str], project_id: Optional[str]) -> Optional[Union[str, dict]]:
     """Helper to resolve the code-map file path or dict from codeMapPath or projectId."""
+    # Sanitize string inputs from frontend (e.g. "null", "undefined", empty strings)
     if code_map_path:
-        return code_map_path
+        code_map_path = code_map_path.strip()
+        if not code_map_path or code_map_path.lower() in ("null", "undefined", "none"):
+            code_map_path = None
+
     if project_id:
-        graph = await get_graph(project_id)
-        if graph and graph.get("codeMap"):
-            cm = graph["codeMap"]
+        project_id = project_id.strip()
+        if not project_id or project_id.lower() in ("null", "undefined", "none"):
+            project_id = None
+
+    # Case 1: code_map_path was provided directly and exists on disk
+    if code_map_path:
+        p = Path(code_map_path)
+        if p.is_file():
+            return str(p.resolve())
+        elif (p / "repository-code-map.json").is_file():
+            return str((p / "repository-code-map.json").resolve())
+        elif not project_id:
+            # If no project_id is available, return raw string
+            return code_map_path
+
+    # Case 2: project_id provided (or fallback if code_map_path did not exist on disk)
+    if project_id:
+        try:
+            graph = await get_graph(project_id)
+        except Exception as exc:
+            backend_logger.warning(f"[CodeMapResolver] get_graph({project_id}) error: {exc}")
+            graph = None
+
+        if not graph:
+            return None
+
+        p_name = graph.get("projectName")
+        p_path = graph.get("projectPath")
+        cm = graph.get("codeMap") or {}
+
+        cand_path = None
+        if isinstance(cm, dict):
             cand_path = cm.get("project", {}).get("codeMapPath") or cm.get("codeMapPath")
-            if cand_path and Path(cand_path).exists():
-                return cand_path
-            p_name = graph.get("projectName")
-            if p_name:
-                fallback_file = Path("C:/Users/Mohak/Desktop/test") / p_name / "repository-code-map.json"
-                if fallback_file.exists():
-                    return str(fallback_file)
+        if not cand_path and code_map_path:
+            cand_path = code_map_path
+
+        # 1. Search for repository-code-map.json on disk
+        found_file = _find_code_map_on_disk(
+            project_name=p_name,
+            project_path=p_path,
+            project_id=project_id,
+            candidate_path=cand_path,
+        )
+        if found_file:
+            return found_file
+
+        # 2. If no file on disk, check if codeMap stored in DB contains valid files
+        if isinstance(cm, dict) and bool(cm.get("files")):
             return cm
+
     return None
 
 
@@ -415,5 +575,69 @@ async def trigger_retrieve_code_endpoint(req: RetrievedCodeRequest):
         )
 
     raise HTTPException(status_code=502, detail="Local Agent code retrieval was unreachable or failed.")
+
+
+@router.get("/api/test-scripts", response_model=TestScriptResponse)
+async def check_test_scripts_endpoint(
+    codeMapPath: Optional[str] = None,
+    projectId: Optional[str] = None,
+):
+    code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    existing_scripts = get_existing_test_scripts(code_map_source)
+    if existing_scripts:
+        successful_count = sum(1 for s in existing_scripts if s.get("status") == "success")
+        failed_count = len(existing_scripts) - successful_count
+        return TestScriptResponse(
+            status="success",
+            alreadyExists=True,
+            generatedCount=len(existing_scripts),
+            successfulCount=successful_count,
+            failedCount=failed_count,
+            scripts=existing_scripts,
+            message=f"Found {len(existing_scripts)} generated test script(s) ({successful_count} valid, {failed_count} failed cross-validation).",
+        )
+    return TestScriptResponse(
+        status="not_found",
+        alreadyExists=False,
+        generatedCount=0,
+        successfulCount=0,
+        failedCount=0,
+        scripts=[],
+        message="No test scripts found yet.",
+    )
+
+
+@router.post("/api/test-scripts", response_model=TestScriptResponse)
+async def generate_test_scripts_endpoint(req: TestScriptRequest):
+    code_map_source = await _resolve_code_map_source(req.codeMapPath, req.projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    try:
+        result = await generate_all_test_scripts(
+            code_map_source=code_map_source,
+            force=req.force or False,
+            analysis_id=req.projectId,
+        )
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=result.get("message"))
+        return TestScriptResponse(
+            status="success",
+            alreadyExists=False,
+            generatedCount=result.get("generatedCount", 0),
+            successfulCount=result.get("successfulCount", 0),
+            scriptsDir=result.get("scriptsDir"),
+            projectEnvironment=result.get("projectEnvironment"),
+            scripts=result.get("scripts", []),
+            message=result.get("message", "Test scripts generated successfully."),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        backend_logger.error(f"Error generating test scripts: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate test scripts: {str(exc)}")
 
 
