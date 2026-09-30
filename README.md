@@ -27,7 +27,18 @@ OpenRouter LLM  +  PostgreSQL
 
 ---
 
-## Quick Start
+## Quick Start (Automated)
+
+On Windows, you can set up and run everything in two steps:
+
+1. **Initial Setup (run once):**
+   Double-click `setup.bat` (or run `./setup.bat` in terminal). This installs dependencies for Agent, Backend, and Web, creates default `.env` files, and sets up Python `venv`.
+2. **Start All Services:**
+   Double-click `start_all.bat`. This starts PostgreSQL, the Local Agent (3001), Backend API (5000), and Frontend (3000), then automatically opens your browser at http://localhost:3000.
+
+---
+
+## Quick Start (Manual)
 
 ### 1. Start PostgreSQL
 
@@ -44,14 +55,12 @@ This starts a PostgreSQL 16 instance at `localhost:5432` with database `dependen
 Edit `backend/.env` and fill in your credentials:
 
 ```env
-OPENROUTER_API_KEY=your_actual_openrouter_api_key
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct
+# Provider options: groq | gemini | hf | mistral | openrouter
+LLM_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/dependency_graph
 PORT=5000
 ```
-
-> If you used the Docker Compose above, the DATABASE_URL above will work as-is.
 
 ---
 
@@ -59,13 +68,8 @@ PORT=5000
 
 ```powershell
 cd backend
-venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
+venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 5000 --reload
 ```
-
-The backend will:
-- Connect to PostgreSQL and create tables on startup
-- Be ready at http://localhost:5000
-- Serve API docs at http://localhost:5000/docs
 
 ---
 
@@ -77,8 +81,6 @@ npm start
 ```
 
 The agent will be ready at http://localhost:3001.
-
-> **First run**: The `postinstall` script downloads Tree-sitter WASM grammar files to `agent/wasm/`. This requires an internet connection. Subsequent runs use cached files.
 
 ---
 
@@ -96,34 +98,32 @@ Open http://localhost:3000 in your browser.
 ## Usage
 
 1. Open http://localhost:3000
-2. Enter the **full path** to any JS/TS project on your machine
-   - Example: `C:\Projects\my-react-app`
-   - Example: `C:\Users\Mohak\Projects\express-api`
+2. Enter the **full path** to any project on your machine (e.g. `C:\Projects\my-app`)
 3. Click **Start Analysis**
-4. Watch the progress panel as your project is scanned, parsed, and analyzed
-5. View the interactive dependency graph
-6. Click any **node** to see its source location and metadata
-7. Click any **edge** to see the relationship evidence
+4. View the interactive dependency graph, generated feature contexts, test cases, and test execution results.
 
 ---
 
 ## Output Files
 
-For every analyzed project, the agent writes to `C:\Users\Mohak\Desktop\test\`:
+For every analyzed project, the agent writes to `./analysis_output/` (or the directory configured in `ANALYSIS_OUTPUT_DIR`):
 
 ```
-C:\Users\Mohak\Desktop\test\
-└── <project-folder-name>\
-    ├── <project-name>_parse\
+analysis_output/
+└── <project-folder-name>/
+    ├── <project-name>_parse/
     │   ├── src_App_jsx_a3f9c1.json      ← per-file AST artifacts
-    │   ├── src_api_client_js_b2e4f1.json
     │   └── ...
-    └── repository-code-map.json          ← full Code Map sent to backend
+    ├── repository-code-map.json          ← full Code Map sent to backend
+    ├── feature_contexts/                 ← feature contexts
+    ├── unit_test_cases/                  ← generated test cases
+    ├── test_scripts/                     ← generated test scripts
+    └── execution_results/                ← test execution output & logs
 ```
 
 Configure via `agent/.env`:
 ```env
-ANALYSIS_OUTPUT_DIR=C:\Users\Mohak\Desktop\test
+ANALYSIS_OUTPUT_DIR=./analysis_output
 ```
 
 ---

@@ -193,10 +193,10 @@ def _find_code_map_on_disk(
     # 3. Base output directories discovery
     base_dirs: list[Path] = []
     if getattr(settings, "analysis_output_dir", None):
-        base_dirs.append(Path(settings.analysis_output_dir))
+        base_dirs.append(Path(settings.analysis_output_dir).resolve())
     env_out = os.environ.get("ANALYSIS_OUTPUT_DIR")
-    if env_out and Path(env_out) not in base_dirs:
-        base_dirs.append(Path(env_out))
+    if env_out and Path(env_out).resolve() not in base_dirs:
+        base_dirs.append(Path(env_out).resolve())
 
     # Fallback: check agent/.env if not already discovered
     try:
@@ -207,10 +207,19 @@ def _find_code_map_on_disk(
                     line = line.strip()
                     if line.startswith("ANALYSIS_OUTPUT_DIR="):
                         val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if val and Path(val) not in base_dirs:
-                            base_dirs.append(Path(val))
+                        if val:
+                            p_val = Path(val)
+                            if not p_val.is_absolute():
+                                p_val = (BACKEND_DIR.parent / p_val).resolve()
+                            if p_val not in base_dirs:
+                                base_dirs.append(p_val)
     except Exception:
         pass
+
+    # Default fallback: analysis_output directory in project root
+    default_out = (BACKEND_DIR.parent / "analysis_output").resolve()
+    if default_out not in base_dirs:
+        base_dirs.append(default_out)
 
     # Search in discovered base directories
     for base_dir in base_dirs:
