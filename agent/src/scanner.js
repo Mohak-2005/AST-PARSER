@@ -34,7 +34,12 @@ function scanProject(projectPath, config, analysisId = null) {
       if (entry.isDirectory()) {
         totalDirectoriesDiscovered++;
         const relDirPath = path.relative(projectPath, fullPath).replace(/\\/g, '/') || entry.name;
-        const dirClass = classifyDirectory(entry.name, config.ignoreDirs);
+        let dirClass = classifyDirectory(entry.name, config.ignoreDirs);
+        if (!dirClass.shouldSkip) {
+          if (fs.existsSync(path.join(fullPath, 'pyvenv.cfg'))) {
+            dirClass = { shouldSkip: true, reason: 'virtual_environment' };
+          }
+        }
 
         if (dirClass.shouldSkip) {
           const reason = dirClass.reason || 'ignored_directory';

@@ -74,8 +74,19 @@ function classifyDirectory(dirName, customIgnoreDirs = []) {
   if (!dirName) return { shouldSkip: false, reason: null };
   const lower = dirName.toLowerCase().trim();
 
-  // 1. Virtual environments (.venv, venv, env, ENV)
-  if (VIRTUAL_ENV_DIRS.has(dirName) || VIRTUAL_ENV_DIRS.has(lower)) {
+  // 1. Virtual environments (.venv, venv, env, ENV, custom-named *_env / *_venv)
+  if (
+    VIRTUAL_ENV_DIRS.has(dirName) ||
+    VIRTUAL_ENV_DIRS.has(lower) ||
+    lower.endsWith('_env') ||
+    lower.endsWith('-env') ||
+    lower.endsWith('_venv') ||
+    lower.endsWith('-venv') ||
+    lower.startsWith('env_') ||
+    lower.startsWith('venv_') ||
+    lower === 'site-packages' ||
+    lower === '.conda'
+  ) {
     return { shouldSkip: true, reason: 'virtual_environment' };
   }
 

@@ -416,7 +416,8 @@ export default function App() {
       await startAnalysis(projectPath);
       startPolling();
     } catch (e) {
-      setError(e.response?.data?.detail || e.message || 'Failed to start analysis');
+      const errMsg = e.response?.data?.error || e.response?.data?.detail || e.message || 'Failed to start analysis';
+      setError(errMsg);
       setView('home');
     }
   };
