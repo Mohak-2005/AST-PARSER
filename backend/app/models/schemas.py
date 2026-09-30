@@ -139,6 +139,7 @@ class UnitTestCaseRequest(BaseModel):
     codeMapPath: Optional[str] = None
     projectId: Optional[str] = None
     force: Optional[bool] = False
+    testType: Optional[str] = "unit"
 
 
 class UnitTestCaseResponse(BaseModel):
@@ -148,12 +149,15 @@ class UnitTestCaseResponse(BaseModel):
     savedFiles: list[str] = []
     message: str = "Unit test cases generated successfully"
     alreadyExists: bool = False
+    testType: Optional[str] = "unit"
+    breakdown: Optional[dict] = {}
 
 
 class RetrievedCodeRequest(BaseModel):
     codeMapPath: Optional[str] = None
     projectId: Optional[str] = None
     projectPath: Optional[str] = None
+    testType: Optional[str] = None
 
 
 class RetrievedCodeResponse(BaseModel):
@@ -163,12 +167,14 @@ class RetrievedCodeResponse(BaseModel):
     files: list[dict] = []
     message: str = ""
     alreadyExists: bool = False
+    testType: Optional[str] = None
 
 
 class TestScriptRequest(BaseModel):
     codeMapPath: Optional[str] = None
     projectId: Optional[str] = None
     force: Optional[bool] = False
+    testType: Optional[str] = None
 
 
 class TestScriptResponse(BaseModel):
@@ -181,4 +187,49 @@ class TestScriptResponse(BaseModel):
     scripts: list[dict] = []
     message: str = ""
     alreadyExists: bool = False
+    testType: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Test Execution models
+# ---------------------------------------------------------------------------
+
+class TestExecutionRequest(BaseModel):
+    codeMapPath: Optional[str] = None
+    projectId: Optional[str] = None
+    testType: Optional[str] = None
+    scriptFiles: Optional[list[str]] = None
+    timeoutSeconds: Optional[float] = None
+
+
+class TestExecutionResult(BaseModel):
+    testCaseId: str
+    scriptFile: str
+    testType: str = "unit"
+    status: str   # 'passed' | 'failed' | 'error' | 'skipped'
+    exitCode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    durationMs: float = 0.0
+    runner: str = ""
+    failureType: Optional[str] = None
+    command: Optional[str] = None
+    workingDirectory: Optional[str] = None
+    projectRoot: Optional[str] = None
+    startupCommand: Optional[str] = None
+    stage: Optional[str] = None
+    evidence: Optional[str] = None
+
+
+class TestExecutionResponse(BaseModel):
+    status: str
+    totalTests: int = 0
+    passed: int = 0
+    failed: int = 0
+    durationMs: float = 0.0
+    runner: str = ""
+    results: list[TestExecutionResult] = []
+    message: str = ""
+    summaryPath: Optional[str] = None
+
 

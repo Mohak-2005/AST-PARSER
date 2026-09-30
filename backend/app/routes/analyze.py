@@ -20,6 +20,8 @@ from app.models.schemas import (
     RetrievedCodeResponse,
     TestScriptRequest,
     TestScriptResponse,
+    TestExecutionRequest,
+    TestExecutionResponse,
 )
 from app.services.llm_service import generate_dependency_graph
 from app.services.graph_validator import validate_graph
@@ -30,11 +32,16 @@ from app.services.feature_context_generator import (
 )
 from app.services.unit_test_generator import (
     generate_all_unit_test_cases,
+    generate_all_test_cases,
     get_existing_test_cases,
 )
 from app.services.test_script_generator import (
     generate_all_test_scripts,
     get_existing_test_scripts,
+)
+from app.services.test_executor import (
+    run_project_test_execution,
+    get_existing_execution_results,
 )
 from app.logger import backend_logger, log_stage, log_error
 
@@ -398,26 +405,31 @@ async def create_feature_contexts_endpoint(req: FeatureContextRequest):
 async def check_unit_test_cases_endpoint(
     codeMapPath: Optional[str] = None,
     projectId: Optional[str] = None,
+    testType: Optional[str] = None,
 ):
     code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
     if not code_map_source:
         raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
 
-    existing_files = get_existing_test_cases(code_map_source)
+    t_filter = (testType or "").strip().lower() if testType else None
+    existing_files = get_existing_test_cases(code_map_source, test_type=t_filter)
     if existing_files:
+        label = t_filter.capitalize() if t_filter else "Unit"
         return UnitTestCaseResponse(
             status="already_exists",
             alreadyExists=True,
             testCaseCount=len(existing_files),
             savedFiles=[f.name for f in existing_files],
-            message="Unit test cases already generated.",
+            message=f"{label} test cases already generated.",
+            testType=t_filter or "unit",
         )
     return UnitTestCaseResponse(
         status="not_found",
         alreadyExists=False,
         testCaseCount=0,
         savedFiles=[],
-        message="No unit test cases generated yet.",
+        message="No test cases generated yet.",
+        testType=t_filter or "unit",
     )
 
 
@@ -427,33 +439,38 @@ async def create_unit_test_cases_endpoint(req: UnitTestCaseRequest):
     if not code_map_source:
         raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
 
+    req_type = (req.testType or "unit").strip().lower()
+
     # Guard check: Do not invoke LLM if valid test cases exist and force is False
     if not req.force:
-        existing_files = get_existing_test_cases(code_map_source)
+        existing_files = get_existing_test_cases(code_map_source, test_type=req_type if req_type != "all" else None)
         if existing_files:
             return UnitTestCaseResponse(
                 status="already_exists",
                 alreadyExists=True,
                 testCaseCount=len(existing_files),
                 savedFiles=[f.name for f in existing_files],
-                message="Unit test cases already generated.",
+                message=f"{req_type.capitalize()} test cases already generated.",
+                testType=req_type,
             )
 
     try:
-        res = await generate_all_unit_test_cases(code_map_source, force=bool(req.force))
+        res = await generate_all_test_cases(code_map_source, force=bool(req.force), test_type=req_type)
         return UnitTestCaseResponse(
             status=res.get("status", "success"),
             alreadyExists=res.get("alreadyExists", False),
             testCaseCount=res.get("testCaseCount", 0),
             unitCount=res.get("unitCount", 0),
             savedFiles=res.get("savedFiles", []),
-            message=res.get("message", "Unit test cases generated successfully."),
+            message=res.get("message", "Test cases generated successfully."),
+            testType=res.get("testType", req_type),
+            breakdown=res.get("breakdown", {}),
         )
     except ValueError as val_err:
-        backend_logger.warning(f"[UnitTestGenerator] Input/validation notice: {val_err}")
+        backend_logger.warning(f"[TestCaseGenerator] Input/validation notice: {val_err}")
         raise HTTPException(status_code=422, detail=str(val_err))
     except Exception as exc:
-        backend_logger.error(f"[UnitTestGenerator] Endpoint error: {exc}")
+        backend_logger.error(f"[TestCaseGenerator] Endpoint error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -639,5 +656,61 @@ async def generate_test_scripts_endpoint(req: TestScriptRequest):
     except Exception as exc:
         backend_logger.error(f"Error generating test scripts: {exc}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to generate test scripts: {str(exc)}")
+
+
+@router.post("/api/test-execution", response_model=TestExecutionResponse)
+async def execute_tests_endpoint(req: TestExecutionRequest):
+    code_map_source = await _resolve_code_map_source(req.codeMapPath, req.projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    try:
+        exec_kwargs = {}
+        if req.timeoutSeconds is not None:
+            exec_kwargs["timeout_s"] = req.timeoutSeconds
+
+        result = run_project_test_execution(
+            code_map_source=code_map_source,
+            test_type=req.testType,
+            script_files=req.scriptFiles,
+            **exec_kwargs
+        )
+        return TestExecutionResponse(**result)
+    except Exception as exc:
+        backend_logger.error(f"[TestExecution] Execution error: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to execute tests: {str(exc)}")
+
+
+@router.get("/api/test-execution", response_model=TestExecutionResponse)
+async def get_test_execution_endpoint(
+    codeMapPath: Optional[str] = None,
+    projectId: Optional[str] = None,
+):
+    code_map_source = await _resolve_code_map_source(codeMapPath, projectId)
+    if not code_map_source:
+        raise HTTPException(status_code=400, detail="codeMapPath or valid projectId is required")
+
+    summary = get_existing_execution_results(code_map_source)
+    if summary:
+        return TestExecutionResponse(
+            status=summary.get("status", "success"),
+            totalTests=summary.get("totalTests", 0),
+            passed=summary.get("passed", 0),
+            failed=summary.get("failed", 0),
+            durationMs=summary.get("durationMs", 0.0),
+            runner=summary.get("runner", ""),
+            results=summary.get("results", []),
+            message=f"Found existing execution results ({summary.get('passed', 0)} passed, {summary.get('failed', 0)} failed)."
+        )
+    return TestExecutionResponse(
+        status="not_found",
+        totalTests=0,
+        passed=0,
+        failed=0,
+        durationMs=0.0,
+        runner="none",
+        results=[],
+        message="No test execution results found."
+    )
 
 

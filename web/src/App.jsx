@@ -36,8 +36,9 @@ export default function App() {
   // Feature Context Generation state — idle | loading | already_exists | success | error
   const [featureCtx, setFeatureCtx] = useState({ status: 'idle', step: 'idle', message: null, data: null });
 
-  // Unit Test Cases Generation state — idle | loading | already_exists | success | error
+  // Test Cases Generation state — idle | loading | already_exists | success | error
   const [testCasesState, setTestCasesState] = useState({ status: 'idle', step: 'idle', message: null, data: null });
+  const [selectedTestType, setSelectedTestType] = useState('all'); // 'all' | 'unit' | 'functional' | 'api'
 
   // Code Retrieval state
   const [hasRetrievedCode, setHasRetrievedCode] = useState(false);
@@ -60,7 +61,7 @@ export default function App() {
     error: null
   });
 
-  const handleGenerateTestCases = async () => {
+  const handleGenerateTestCases = async (forceType = null) => {
     // Prevent duplicate requests while running
     if (testCasesState.status === 'loading') return;
 
@@ -79,10 +80,12 @@ export default function App() {
       return;
     }
 
-    const payload = { codeMapPath, projectId };
+    const testType = forceType || selectedTestType || 'all';
+    const payload = { codeMapPath, projectId, testType };
+    const typeLabel = testType === 'all' ? 'All (Unit, Functional & API)' : testType.toUpperCase();
 
     // STEP 1: Check whether test cases already exist FIRST
-    setTestCasesState({ status: 'loading', step: 'checking', message: 'Checking existing test cases…', data: null });
+    setTestCasesState({ status: 'loading', step: 'checking', message: `Checking existing ${typeLabel} test cases…`, data: null });
 
     try {
       const checkRes = await checkTestCases(payload);
@@ -90,37 +93,38 @@ export default function App() {
         setTestCasesState({
           status: 'already_exists',
           step: 'done',
-          message: checkRes.data.message || 'Unit test cases already generated.',
+          message: checkRes.data.message || `${typeLabel} test cases already generated.`,
           data: checkRes.data,
         });
         return;
       }
     } catch (checkErr) {
-      console.warn('[UnitTestGenerator] Check notice:', checkErr);
+      console.warn('[TestCaseGenerator] Check notice:', checkErr);
     }
 
-    // STEP 2: Generate unit test cases via backend
+    // STEP 2: Generate test cases via backend
     setTestCasesState({
       status: 'loading',
       step: 'generating',
-      message: 'Generating Unit Test Cases...',
+      message: `Generating ${typeLabel} Test Cases...`,
       data: null,
     });
 
     try {
-      const { data } = await generateTestCases(payload);
+      const { data } = await generateTestCases({ ...payload, force: true });
       if (data.alreadyExists) {
         setTestCasesState({
           status: 'already_exists',
           step: 'done',
-          message: data.message || 'Unit test cases already generated.',
+          message: data.message || `${typeLabel} test cases already generated.`,
           data,
         });
       } else {
+        const breakdownStr = data.breakdown ? ` (Unit: ${data.breakdown.unit || 0}, Func: ${data.breakdown.functional || 0}, API: ${data.breakdown.api || 0})` : '';
         setTestCasesState({
           status: 'success',
           step: 'done',
-          message: data.message || `Unit test cases generated successfully (${data.testCaseCount || 0} tests).`,
+          message: data.message || `Test cases generated successfully (${data.testCaseCount || 0} tests${breakdownStr}).`,
           data,
         });
       }
@@ -136,7 +140,7 @@ export default function App() {
         err.response?.data?.detail ||
         err.response?.data?.error ||
         err.message ||
-        'Unit test case generation failed';
+        'Test case generation failed';
       setTestCasesState({ status: 'error', step: 'idle', message: errMsg, data: null });
     }
   };
@@ -574,31 +578,46 @@ export default function App() {
                 </button>
               )}
 
-              {/* Generate Test Cases button - visible ONLY when feature-context generation has successfully completed */}
+              {/* Generate Test Cases button & Test Type Selector - visible ONLY when feature-context generation has successfully completed */}
               {(featureCtx.status === 'success' || featureCtx.status === 'already_exists') && (
-                <button
-                  onClick={handleGenerateTestCases}
-                  disabled={testCasesState.status === 'loading'}
-                  className="flex items-center gap-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-emerald-600"
-                  title="Generate unit test case specifications from the current project's code map"
-                >
-                  {testCasesState.status === 'loading' ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : testCasesState.status === 'already_exists' || testCasesState.status === 'success' ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-300" />
-                  ) : testCasesState.status === 'error' ? (
-                    <AlertCircle className="w-4 h-4" />
-                  ) : (
-                    <TestTube2 className="w-4 h-4" />
-                  )}
-                  {testCasesState.status === 'loading'
-                    ? 'Generating Test Cases...'
-                    : testCasesState.status === 'already_exists'
-                    ? 'Test Cases Already Generated'
-                    : testCasesState.status === 'success'
-                    ? 'Test Cases Generated'
-                    : 'Generate Test Cases'}
-                </button>
+                <div className="flex items-center rounded-lg bg-slate-800/90 border border-slate-700/80 p-0.5 shadow-sm">
+                  <select
+                    value={selectedTestType}
+                    onChange={(e) => setSelectedTestType(e.target.value)}
+                    disabled={testCasesState.status === 'loading'}
+                    className="bg-transparent text-xs font-semibold text-emerald-400 pl-2 pr-1 py-1.5 focus:outline-none cursor-pointer disabled:opacity-50 border-r border-slate-700 mr-1"
+                    title="Select Test Type to generate"
+                  >
+                    <option value="all" className="bg-slate-900 text-slate-200">All (Unit+Func+API)</option>
+                    <option value="unit" className="bg-slate-900 text-slate-200">Unit Tests</option>
+                    <option value="functional" className="bg-slate-900 text-slate-200">Functional Tests</option>
+                    <option value="api" className="bg-slate-900 text-slate-200">API Tests</option>
+                  </select>
+
+                  <button
+                    onClick={() => handleGenerateTestCases()}
+                    disabled={testCasesState.status === 'loading'}
+                    className="flex items-center gap-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                    title={`Generate ${selectedTestType} test case specifications from the current project's code map`}
+                  >
+                    {testCasesState.status === 'loading' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : testCasesState.status === 'already_exists' || testCasesState.status === 'success' ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />
+                    ) : testCasesState.status === 'error' ? (
+                      <AlertCircle className="w-3.5 h-3.5" />
+                    ) : (
+                      <TestTube2 className="w-3.5 h-3.5" />
+                    )}
+                    {testCasesState.status === 'loading'
+                      ? 'Generating...'
+                      : testCasesState.status === 'already_exists'
+                      ? 'Tests Generated'
+                      : testCasesState.status === 'success'
+                      ? 'Tests Generated'
+                      : 'Generate Tests'}
+                  </button>
+                </div>
               )}
 
               {/* Generate Feature Context button */}
@@ -775,6 +794,8 @@ export default function App() {
         loading={testScriptsModal.loading}
         onRefresh={() => handleGenerateOrOpenTestScripts(true)}
         projectName={graphData?.projectName || ''}
+        codeMapPath={graphData?.codeMap?.project?.codeMapPath || graphData?.codeMap?.codeMapPath || null}
+        projectId={projectId}
       />
     </div>
   );

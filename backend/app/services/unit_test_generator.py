@@ -58,6 +58,51 @@ from app.services.llm_provider import (
 # Existing Test Case Output Guard
 # ---------------------------------------------------------------------------
 
+def is_valid_test_case(tc: Any, expected_test_type: Optional[str] = None) -> bool:
+    """
+    Deterministically checks if a test case object satisfies the schema for unit, functional, or API test cases:
+    - dict with non-empty testCaseId, title, description, inputs, expectedResult
+    - testType matches expected_test_type (if specified), or is one of ('unit', 'functional', 'api', 'e2e', 'integration')
+    - unit/target is a dict containing non-empty file, and non-empty symbol or route
+    """
+    if not isinstance(tc, dict):
+        return False
+    tc_type = str(tc.get("testType", "")).strip().lower()
+    if expected_test_type:
+        exp_norm = expected_test_type.strip().lower()
+        if exp_norm != "all":
+            if exp_norm in ("functional", "e2e"):
+                if tc_type not in ("functional", "e2e"):
+                    return False
+            elif tc_type != exp_norm:
+                return False
+    elif tc_type not in ("unit", "functional", "api", "integration", "e2e"):
+        return False
+
+    if not tc.get("testCaseId") or not isinstance(tc.get("testCaseId"), str):
+        return False
+    if not tc.get("title") or not isinstance(tc.get("title"), str):
+        return False
+    if not tc.get("description") or not isinstance(tc.get("description"), str):
+        return False
+    if "inputs" not in tc or tc.get("inputs") is None:
+        return False
+    if "expectedResult" not in tc or not str(tc.get("expectedResult", "")).strip():
+        return False
+
+    unit_obj = tc.get("unit") or tc.get("target")
+    if not isinstance(unit_obj, dict):
+        return False
+    if not unit_obj.get("file") or not isinstance(unit_obj.get("file"), str):
+        return False
+    # Require symbol or route/endpoint
+    has_target = bool(unit_obj.get("symbol") or unit_obj.get("route") or unit_obj.get("endpoint") or unit_obj.get("path"))
+    if not has_target:
+        return False
+
+    return True
+
+
 def is_valid_unit_test_case(tc: Any) -> bool:
     """
     Deterministically checks if a test case object satisfies the minimum unit test schema:
@@ -93,15 +138,15 @@ def is_valid_unit_test_case(tc: Any) -> bool:
     return True
 
 
-def get_existing_test_cases(code_map_source: Union[str, Path, dict]) -> List[Path]:
+def get_existing_test_cases(code_map_source: Union[str, Path, dict], test_type: Optional[str] = None) -> List[Path]:
     """
     Dynamically inspects <directory containing repository-code-map.json>/test-cases/
-    to detect any valid, previously generated unit test case JSON files.
+    to detect any valid, previously generated test case JSON files matching test_type (or any valid test case if None).
 
     A file is considered valid if:
     - It has a .json extension
     - It parses as valid JSON
-    - It contains at least one valid unit test case (under 'testCases' list or root list)
+    - It contains at least one valid test case matching the specified test_type (or any valid test case if None)
 
     Returns a list of Path objects for all valid test case files found.
     """
@@ -142,8 +187,8 @@ def get_existing_test_cases(code_map_source: Union[str, Path, dict]) -> List[Pat
                 elif isinstance(content, list):
                     cases = content
 
-                # Require at least 1 valid unit test case
-                if any(is_valid_unit_test_case(c) for c in cases):
+                # Check for valid test cases matching test_type (or any valid if test_type is None)
+                if any(is_valid_test_case(c, expected_test_type=test_type) for c in cases):
                     valid_files.append(json_file)
         except Exception:
             continue
@@ -365,6 +410,227 @@ def discover_testable_units(
                         })
 
     return discovered_units
+
+
+def discover_functional_targets(
+    code_map: dict,
+    file_to_features: Optional[Dict[str, List[dict]]] = None
+) -> List[dict]:
+    """
+    Dynamically discovers functional test targets (UI components, pages, user workflows, feature flows)
+    grounded in actual code map declarations, React metadata, and feature contexts.
+    Language- and framework-agnostic.
+    """
+    files_dict = code_map.get("files", {})
+    discovered: List[dict] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for file_path, file_data in files_dict.items():
+        if not isinstance(file_data, dict):
+            continue
+        language = file_data.get("language") or file_data.get("file", {}).get("language", "")
+        f_feats = file_to_features.get(file_path, []) if file_to_features else []
+
+        # 1. React components and hooks from parser metadata
+        react_meta = file_data.get("react") or {}
+        if isinstance(react_meta, dict):
+            components = react_meta.get("components") or []
+            for comp in components:
+                c_name = comp if isinstance(comp, str) else comp.get("name") if isinstance(comp, dict) else None
+                if c_name and c_name.lower() not in NON_TESTABLE_NAMES:
+                    key = (file_path, c_name)
+                    if key not in seen:
+                        seen.add(key)
+                        discovered.append({
+                            "file": file_path,
+                            "symbol": c_name,
+                            "type": "component",
+                            "language": language,
+                            "features": f_feats,
+                            "props": comp.get("props", []) if isinstance(comp, dict) else [],
+                            "hooks": react_meta.get("hooks", []),
+                        })
+
+        # 2. Declarations with component / page / view type or naming convention
+        declarations = file_data.get("declarations") or file_data.get("symbols") or []
+        for decl in declarations:
+            if not isinstance(decl, dict):
+                continue
+            name = (decl.get("name") or "").strip()
+            dtype = (decl.get("type") or "").strip().lower()
+            line = decl.get("line")
+            if not name or name.lower() in NON_TESTABLE_NAMES:
+                continue
+
+            is_functional_candidate = (
+                dtype in ("component", "page", "view", "screen", "controller", "dialog", "modal", "workflow")
+                or name.endswith(("Page", "Screen", "View", "Component", "Dialog", "Modal", "Form", "Workflow"))
+                or (language in ("javascript", "typescript", "jsx", "tsx") and name[0].isupper() and file_path.endswith((".jsx", ".tsx", ".vue", ".svelte")))
+            )
+            if is_functional_candidate:
+                key = (file_path, name)
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append({
+                        "file": file_path,
+                        "symbol": name,
+                        "type": "component" if dtype not in ("page", "view", "controller") else dtype,
+                        "line": line,
+                        "language": language,
+                        "features": f_feats,
+                    })
+
+    # If no UI components were discovered (e.g. backend-only project), fall back to public executable functions/workflows
+    if not discovered:
+        for file_path, file_data in files_dict.items():
+            if not isinstance(file_data, dict):
+                continue
+            language = file_data.get("language") or file_data.get("file", {}).get("language", "")
+            f_feats = file_to_features.get(file_path, []) if file_to_features else []
+            declarations = file_data.get("declarations") or file_data.get("symbols") or []
+            for decl in declarations:
+                if not isinstance(decl, dict):
+                    continue
+                name = (decl.get("name") or "").strip()
+                dtype = (decl.get("type") or "").strip().lower()
+                line = decl.get("line")
+                if not name or name.lower() in NON_TESTABLE_NAMES:
+                    continue
+                if dtype in EXECUTABLE_DECL_TYPES or "func" in dtype:
+                    key = (file_path, name)
+                    if key not in seen:
+                        seen.add(key)
+                        discovered.append({
+                            "file": file_path,
+                            "symbol": name,
+                            "type": "workflow",
+                            "line": line,
+                            "language": language,
+                            "features": f_feats,
+                        })
+
+    return discovered
+
+
+def discover_api_endpoints(
+    code_map: dict,
+    file_to_features: Optional[Dict[str, List[dict]]] = None
+) -> List[dict]:
+    """
+    Dynamically discovers API route and endpoint targets from code map declarations,
+    routes metadata, decorators, and controllers.
+    Language- and framework-agnostic.
+    """
+    files_dict = code_map.get("files", {})
+    discovered: List[dict] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    for file_path, file_data in files_dict.items():
+        if not isinstance(file_data, dict):
+            continue
+        language = file_data.get("language") or file_data.get("file", {}).get("language", "")
+        f_feats = file_to_features.get(file_path, []) if file_to_features else []
+
+        # 1. Inspect explicit 'routes' array in file_data
+        routes = file_data.get("routes") or []
+        for r in routes:
+            if not isinstance(r, dict):
+                continue
+            r_path = r.get("path") or r.get("route") or r.get("endpoint") or ""
+            r_method = (r.get("method") or r.get("httpMethod") or "GET").strip().upper()
+            r_handler = r.get("handler") or r.get("symbol") or r.get("name") or r_path
+            if r_path:
+                key = (file_path, r_method, r_path)
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append({
+                        "file": file_path,
+                        "symbol": r_handler,
+                        "route": r_path,
+                        "httpMethod": r_method,
+                        "type": "route",
+                        "line": r.get("line"),
+                        "language": language,
+                        "features": f_feats,
+                    })
+
+        # 2. Inspect declarations for route decorators or route-like patterns
+        declarations = file_data.get("declarations") or file_data.get("symbols") or []
+        for decl in declarations:
+            if not isinstance(decl, dict):
+                continue
+            name = (decl.get("name") or "").strip()
+            dtype = (decl.get("type") or "").strip().lower()
+            line = decl.get("line")
+            if not name or name.lower() in NON_TESTABLE_NAMES:
+                continue
+
+            decorators = decl.get("decorators") or []
+            has_route_decorator = False
+            route_path = ""
+            http_method = "GET"
+
+            for dec in decorators:
+                dec_str = dec if isinstance(dec, str) else dec.get("text") or dec.get("name") or ""
+                m_route = re.search(r"@(app|router|blueprint|bp)\.(get|post|put|delete|patch|route)\s*\(\s*['\"]([^'\"]+)['\"]", dec_str, re.IGNORECASE)
+                if m_route:
+                    has_route_decorator = True
+                    dec_method = m_route.group(2).upper()
+                    if dec_method != "ROUTE":
+                        http_method = dec_method
+                    route_path = m_route.group(3)
+                    break
+                m_spring = re.search(r"@(Get|Post|Put|Delete|Patch|Request)Mapping\s*(?:\(\s*(?:value\s*=\s*)?['\"]([^'\"]+)['\"])?", dec_str, re.IGNORECASE)
+                if m_spring:
+                    has_route_decorator = True
+                    http_method = m_spring.group(1).upper()
+                    if http_method == "REQUEST":
+                        http_method = "GET"
+                    route_path = m_spring.group(2) or f"/{name.lower()}"
+                    break
+
+            # Check if file is in routes/controllers/api directory
+            norm_f = file_path.replace("\\", "/").lower()
+            is_route_file = any(seg in norm_f for seg in ("/routes/", "/controllers/", "/api/", "/endpoints/"))
+            
+            if has_route_decorator:
+                key = (file_path, http_method, route_path or name)
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append({
+                        "file": file_path,
+                        "symbol": name,
+                        "route": route_path or f"/{name.lower()}",
+                        "httpMethod": http_method,
+                        "type": "route",
+                        "line": line,
+                        "language": language,
+                        "features": f_feats,
+                    })
+            elif is_route_file and (dtype in EXECUTABLE_DECL_TYPES or "func" in dtype or dtype == "method"):
+                # Infer HTTP method from handler name if possible
+                inferred_method = "GET"
+                for m_candidate in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+                    if name.upper().startswith(m_candidate) or name.upper().endswith(m_candidate):
+                        inferred_method = m_candidate
+                        break
+                inferred_route = f"/api/{name.lower().replace('_', '-')}"
+                key = (file_path, inferred_method, inferred_route)
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append({
+                        "file": file_path,
+                        "symbol": name,
+                        "route": inferred_route,
+                        "httpMethod": inferred_method,
+                        "type": "route",
+                        "line": line,
+                        "language": language,
+                        "features": f_feats,
+                    })
+
+    return discovered
+
 
 
 # ---------------------------------------------------------------------------
@@ -662,16 +928,140 @@ def build_generation_messages(focused_context: dict) -> list:
     ]
 
 
-async def generate_test_cases_for_group(focused_context: dict) -> list:
+FUNCTIONAL_TEST_SCHEMA = {
+    "testCases": [
+        {
+            "testCaseId": "TC-001",
+            "unit": {
+                "file": "relative/path/to/file",
+                "symbol": "ComponentNameOrWorkflow",
+                "type": "component|workflow"
+            },
+            "title": "Clear concise functional test scenario title",
+            "description": "Explains user workflow, interactions, state transitions, and expected outcome",
+            "preconditions": ["Prerequisites or initial component/page state"],
+            "inputs": {"userActions": ["action 1", "action 2"], "propsOrState": {}},
+            "expectedResult": "Expected DOM rendered state, callback invocations, or workflow transition",
+            "testType": "functional",
+            "priority": "high|medium|low",
+            "rationale": "Why this functional behavior verification is necessary based on code evidence"
+        }
+    ]
+}
+
+
+def build_functional_generation_messages(focused_context: dict) -> list:
+    """
+    Builds the system and user messages for Functional Test Case Generation.
+    Focuses on user interactions, page/component workflows, state transitions, and DOM outcomes.
+    Strictly forbids inventing arbitrary CSS selectors or ungrounded behaviors.
+    """
+    system_content = (
+        "You are an expert software verification engineer specializing in FUNCTIONAL & USER WORKFLOW TESTING.\n\n"
+        "Your task is to generate structured FUNCTIONAL TEST CASE SPECIFICATIONS based ONLY on the provided code evidence.\n\n"
+        "============================================================\n"
+        "SOURCE-GROUNDING GUARDRAILS (CRITICAL)\n"
+        "============================================================\n"
+        "1. ONLY FUNCTIONAL TEST CASES are permitted. Every test case MUST have 'testType': 'functional'.\n"
+        "2. Ground tests in actual UI components, event handlers, props, state transitions, and user journeys.\n"
+        "3. DO NOT invent arbitrary CSS selectors, XPath expressions, or ungrounded DOM elements.\n"
+        "4. DO NOT invent business logic, validation rules, or navigation flows not supported by the provided code.\n"
+        "5. Every test case must reference an actual component, page, or workflow target from the provided context.\n"
+        "6. If the evidence is insufficient to verify a complete workflow, report the specific gap instead of guessing.\n\n"
+        "Return ONLY valid JSON matching the schema below. No markdown, no prose."
+    )
+
+    user_content = (
+        f"Focused Functional Context:\n{json.dumps(focused_context, indent=2)}\n\n"
+        f"Required JSON Output Schema:\n{json.dumps(FUNCTIONAL_TEST_SCHEMA, indent=2)}\n\n"
+        "Return ONLY the JSON object with the 'testCases' array."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+API_TEST_SCHEMA = {
+    "testCases": [
+        {
+            "testCaseId": "TC-001",
+            "unit": {
+                "file": "relative/path/to/file",
+                "symbol": "handlerSymbol",
+                "route": "/api/endpoint/path",
+                "httpMethod": "GET|POST|PUT|DELETE|PATCH",
+                "type": "route"
+            },
+            "title": "Clear concise API test scenario title",
+            "description": "Explains the endpoint request variation and expected response behavior",
+            "preconditions": ["Optional server state or authentication token requirement"],
+            "inputs": {"params": {}, "headers": {}, "body": {}},
+            "expectedResult": "Expected HTTP status code (e.g. 200, 201, 400, 404), response schema, or error message",
+            "testType": "api",
+            "priority": "high|medium|low",
+            "rationale": "Why this API contract/endpoint test is necessary based on route and handler evidence"
+        }
+    ]
+}
+
+
+def build_api_generation_messages(focused_context: dict) -> list:
+    """
+    Builds the system and user messages for API Test Case Generation.
+    Focuses on HTTP endpoints, methods, parameters, request bodies, status codes, and response shapes.
+    Strictly forbids fabricating endpoints or ungrounded response schemas.
+    """
+    system_content = (
+        "You are an expert software verification engineer specializing in API & REST ENDPOINT TESTING.\n\n"
+        "Your task is to generate structured API TEST CASE SPECIFICATIONS based ONLY on the provided code evidence.\n\n"
+        "============================================================\n"
+        "SOURCE-GROUNDING GUARDRAILS (CRITICAL)\n"
+        "============================================================\n"
+        "1. ONLY API TEST CASES are permitted. Every test case MUST have 'testType': 'api'.\n"
+        "2. Ground tests in actual route paths, HTTP methods (GET, POST, PUT, DELETE, PATCH), and handler declarations.\n"
+        "3. DO NOT invent endpoints, route paths, HTTP methods, or headers not grounded in the provided code.\n"
+        "4. Assert realistic HTTP status codes (e.g. 200/201 for success, 400/404 for client errors, 500 for server errors) grounded in handler logic.\n"
+        "5. Include positive, negative, and boundary scenarios when supported by parameter validation or branch logic.\n"
+        "6. If the evidence is insufficient to determine an endpoint contract, report the specific gap instead of guessing.\n\n"
+        "Return ONLY valid JSON matching the schema below. No markdown, no prose."
+    )
+
+    user_content = (
+        f"Focused API Context:\n{json.dumps(focused_context, indent=2)}\n\n"
+        f"Required JSON Output Schema:\n{json.dumps(API_TEST_SCHEMA, indent=2)}\n\n"
+        "Return ONLY the JSON object with the 'testCases' array."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_type_aware_generation_messages(focused_context: dict, test_type: str = "unit") -> list:
+    """Dispatches to the appropriate prompt generator based on test_type."""
+    t_norm = (test_type or "unit").strip().lower()
+    if t_norm in ("functional", "e2e"):
+        return build_functional_generation_messages(focused_context)
+    elif t_norm == "api":
+        return build_api_generation_messages(focused_context)
+    return build_generation_messages(focused_context)
+
+
+async def generate_test_cases_for_group(focused_context: dict, test_type: str = "unit") -> list:
     """
     Calls the existing Hugging Face model using execute_hf_llm_call and parses the JSON response.
+    Supports 'unit', 'functional', and 'api' test generation.
     """
-    messages = build_generation_messages(focused_context)
+    messages = build_type_aware_generation_messages(focused_context, test_type=test_type)
+    stage_name = "FUNCTIONAL_TEST_GENERATION" if test_type in ("functional", "e2e") else ("API_TEST_GENERATION" if test_type == "api" else "UNIT_TEST_GENERATION")
     raw_content, _, _ = await execute_hf_llm_call(
         messages=messages,
         max_tokens=3000,
         temperature=0.1,
-        stage_name="UNIT_TEST_GENERATION",
+        stage_name=stage_name,
     )
 
     cleaned = strip_markdown_fences(raw_content)
@@ -684,7 +1074,7 @@ async def generate_test_cases_for_group(focused_context: dict) -> list:
         elif rep_ok and isinstance(rep_data, list):
             parsed = {"testCases": rep_data}
         else:
-            backend_logger.warning("[UnitTestGenerator] LLM output was not valid JSON.")
+            backend_logger.warning(f"[{stage_name}] LLM output was not valid JSON.")
             return []
 
     return parsed.get("testCases", [])
@@ -746,12 +1136,14 @@ def validate_test_cases(
                 backend_logger.warning(f"[UnitTestGenerator] Rejecting non-unit test: {tc.get('title')} ({test_type})")
                 continue
         elif norm_expected_type in ("integration", "functional", "e2e"):
-            if test_type != norm_expected_type:
-                # allow functional/e2e equivalence
-                if not (norm_expected_type in ("functional", "e2e") and test_type in ("functional", "e2e")):
-                    backend_logger.warning(f"[UnitTestGenerator] Rejecting mismatch test type: {tc.get('title')} ({test_type} != {norm_expected_type})")
-                    continue
-        elif norm_expected_type is not None and test_type != norm_expected_type:
+            if test_type not in ("functional", "e2e"):
+                backend_logger.warning(f"[UnitTestGenerator] Rejecting mismatch test type: {tc.get('title')} ({test_type} != {norm_expected_type})")
+                continue
+        elif norm_expected_type == "api":
+            if test_type != "api":
+                backend_logger.warning(f"[UnitTestGenerator] Rejecting non-api test: {tc.get('title')} ({test_type})")
+                continue
+        elif norm_expected_type not in (None, "all") and test_type != norm_expected_type:
             continue
 
         # 2. Required fields
@@ -761,14 +1153,15 @@ def validate_test_cases(
 
         file_ref = (unit_info.get("file") or "").replace("\\", "/").strip()
         symbol_ref = (unit_info.get("symbol") or "").strip()
-        unit_type = (unit_info.get("type") or "function").strip()
+        route_ref = (unit_info.get("route") or unit_info.get("endpoint") or "").strip()
+        unit_type = (unit_info.get("type") or ("route" if route_ref else "function")).strip()
 
         title = str(tc.get("title") or "").strip()
         desc = str(tc.get("description") or "").strip()
         expected = str(tc.get("expectedResult") or "").strip()
         inputs = tc.get("inputs")
 
-        if not file_ref or not symbol_ref or not title or not desc or not expected or inputs is None:
+        if not file_ref or (not symbol_ref and not route_ref) or not title or not desc or not expected or inputs is None:
             continue
 
         # 4. Referenced file must exist in code-map
@@ -776,19 +1169,20 @@ def validate_test_cases(
             backend_logger.warning(f"[UnitTestGenerator] Rejecting test for non-existent file: {file_ref}")
             continue
 
-        # 5. & 9. Symbol must exist in analyzed declarations (no fabrication)
+        # 5. & 9. Symbol/Target must exist in analyzed declarations (no fabrication)
         allowed_symbols = valid_units_by_file.get(file_ref, set())
-        symbol_matches = (
-            symbol_ref in allowed_symbols
-            or symbol_ref.split(".")[-1] in allowed_symbols
-            or any(s.endswith(f".{symbol_ref}") for s in allowed_symbols)
-        )
-        if not symbol_matches:
-            backend_logger.warning(f"[UnitTestGenerator] Rejecting fabricated symbol: {symbol_ref} in {file_ref}")
-            continue
+        if allowed_symbols and symbol_ref:
+            symbol_matches = (
+                symbol_ref in allowed_symbols
+                or symbol_ref.split(".")[-1] in allowed_symbols
+                or any(s.endswith(f".{symbol_ref}") for s in allowed_symbols)
+            )
+            if not symbol_matches and not route_ref:
+                backend_logger.warning(f"[UnitTestGenerator] Rejecting fabricated symbol: {symbol_ref} in {file_ref}")
+                continue
 
         # 8. Check for forbidden integration / E2E / UI terms if unit test
-        if norm_expected_type == "unit":
+        if norm_expected_type == "unit" or test_type == "unit":
             text_to_check = f"{title} {desc}".lower()
             if any(term in text_to_check for term in FORBIDDEN_TEST_TERMS):
                 backend_logger.warning(f"[UnitTestGenerator] Rejecting integration/E2E test: {title}")
@@ -796,7 +1190,7 @@ def validate_test_cases(
 
         # 7. Deduplication
         inputs_str = json.dumps(inputs, sort_keys=True) if isinstance(inputs, (dict, list)) else str(inputs)
-        sig = f"{file_ref}::{symbol_ref}::{title}::{inputs_str}"
+        sig = f"{file_ref}::{symbol_ref or route_ref}::{title}::{inputs_str}"
         if sig in seen_signatures:
             continue
         seen_signatures.add(sig)
@@ -811,21 +1205,31 @@ def validate_test_cases(
         if not isinstance(preconditions, list):
             preconditions = [str(preconditions)] if preconditions else []
 
-        rationale = str(tc.get("rationale") or f"Unit test verifying isolated behavior of {symbol_ref}.").strip()
+        actual_type = test_type if test_type in ("unit", "functional", "api", "integration", "e2e") else (norm_expected_type or "unit")
+        target_label = symbol_ref or route_ref or "target"
+        rationale = str(tc.get("rationale") or f"{actual_type.capitalize()} test verifying behavior of {target_label}.").strip()
+
+        target_dict = {
+            "file": file_ref,
+            "symbol": symbol_ref,
+            "type": unit_type,
+        }
+        if route_ref:
+            target_dict["route"] = route_ref
+        http_method = unit_info.get("httpMethod") or unit_info.get("method")
+        if http_method:
+            target_dict["httpMethod"] = str(http_method).upper()
 
         validated.append({
             "testCaseId": tc_id,
-            "unit": {
-                "file": file_ref,
-                "symbol": symbol_ref,
-                "type": unit_type,
-            },
+            "unit": target_dict,
+            "target": target_dict,
             "title": title,
             "description": desc,
             "preconditions": preconditions,
             "inputs": inputs,
             "expectedResult": expected,
-            "testType": "unit",
+            "testType": actual_type,
             "priority": priority,
             "rationale": rationale,
         })
@@ -992,6 +1396,153 @@ async def generate_all_unit_test_cases(
         "testCaseCount": total_test_cases,
         "unitCount": len(units),
         "message": f"Unit test cases generated successfully ({total_test_cases} test cases across {len(all_saved_files)} file(s)).",
+    }
+
+
+async def generate_all_test_cases(
+    code_map_source: Union[str, Path, dict],
+    force: bool = False,
+    test_type: str = "unit"
+) -> Dict[str, Any]:
+    """
+    Unified entry point for Test Case Generation supporting:
+    - 'unit': isolated functions, methods, classes (delegates to generate_all_unit_test_cases)
+    - 'functional': user workflows, component interactions, state transitions
+    - 'api': endpoints, routes, methods, payloads, status codes
+    - 'all': generates across unit, functional, and api test types
+    """
+    norm_type = (test_type or "unit").strip().lower()
+
+    if norm_type == "unit":
+        res = await generate_all_unit_test_cases(code_map_source, force=force)
+        res["testType"] = "unit"
+        return res
+
+    code_map, code_map_path = load_code_map(code_map_source)
+    if not code_map or not code_map.get("files"):
+        raise ValueError("repository-code-map.json is missing or contains no files.")
+
+    resolved_project_root = resolve_project_root(code_map, code_map_path)
+    feature_contexts = load_existing_feature_contexts(code_map_path) if code_map_path else {}
+    file_to_features = map_files_to_features(feature_contexts)
+
+    # 1. Existing Output Guard Check
+    if not force:
+        existing_files = get_existing_test_cases(code_map_source, test_type=norm_type)
+        if existing_files:
+            msg = f"{norm_type.capitalize()} test cases already generated."
+            backend_logger.info(f"[TestCaseGenerator] {msg} Found {len(existing_files)} file(s). Skipping LLM generation.")
+            total_cases = 0
+            for ef in existing_files:
+                try:
+                    with open(ef, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                        cases = data.get("testCases", []) if isinstance(data, dict) else data
+                        total_cases += len(cases) if isinstance(cases, list) else 0
+                except Exception:
+                    pass
+            return {
+                "status": "already_exists",
+                "alreadyExists": True,
+                "savedFiles": [f.name for f in existing_files],
+                "testCaseCount": total_cases,
+                "unitCount": total_cases,
+                "message": msg,
+                "testType": norm_type,
+            }
+
+    if norm_type == "all":
+        # Run unit, functional, and api
+        results = []
+        all_saved = []
+        total_tc = 0
+        for sub_type in ("unit", "functional", "api"):
+            try:
+                res = await generate_all_test_cases(code_map_source, force=force, test_type=sub_type)
+                if res.get("status") in ("success", "already_exists"):
+                    results.append(res)
+                    all_saved.extend(res.get("savedFiles", []))
+                    total_tc += res.get("testCaseCount", 0)
+            except Exception as e:
+                backend_logger.warning(f"[TestCaseGenerator] sub-type '{sub_type}' generation notice: {e}")
+        return {
+            "status": "success",
+            "alreadyExists": False,
+            "savedFiles": list(set(all_saved)),
+            "testCaseCount": total_tc,
+            "unitCount": total_tc,
+            "message": f"Generated {total_tc} test cases across {len(set(all_saved))} files.",
+            "testType": "all",
+            "breakdown": {r.get("testType", "unknown"): r.get("testCaseCount", 0) for r in results}
+        }
+
+    # Discover targets based on test type
+    if norm_type in ("functional", "e2e"):
+        targets = discover_functional_targets(code_map, file_to_features)
+        prefix = "functional"
+    elif norm_type == "api":
+        targets = discover_api_endpoints(code_map, file_to_features)
+        prefix = "api"
+    else:
+        targets = discover_testable_units(code_map, file_to_features)
+        prefix = "unit"
+
+    if not targets:
+        raise ValueError(f"No testable {norm_type} targets found in repository code map.")
+
+    backend_logger.info(f"[TestCaseGenerator] Discovered {len(targets)} {norm_type} target(s)")
+
+    # Build symbol lookup for validation
+    valid_units_by_file: Dict[str, Set[str]] = defaultdict(set)
+    for u in targets:
+        if u.get("file") and u.get("symbol"):
+            valid_units_by_file[u["file"]].add(u["symbol"])
+        if u.get("route"):
+            valid_units_by_file[u["file"]].add(u["route"])
+
+    groups = group_units_for_generation(targets, feature_contexts)
+    all_saved_files: List[Path] = []
+    total_test_cases = 0
+    existing_filenames: Set[str] = set()
+    generation_failures: List[str] = []
+
+    for group in groups:
+        focused = build_focused_unit_context(group, code_map, code_map_path, project_root=resolved_project_root)
+        try:
+            raw_test_cases = await generate_test_cases_for_group(focused, test_type=norm_type)
+        except Exception as exc:
+            err_str = str(exc)
+            generation_failures.append(f"Group '{group['name']}' API call failed: {err_str}")
+            backend_logger.error(f"[TestCaseGenerator] Group '{group['name']}' generation error: {err_str}")
+            raw_test_cases = []
+
+        if not raw_test_cases:
+            generation_failures.append(f"Group '{group['name']}' returned no parsed test cases")
+            continue
+
+        validated = validate_test_cases(raw_test_cases, valid_units_by_file, code_map, expected_test_type=norm_type)
+        if not validated:
+            generation_failures.append(f"Group '{group['name']}' test cases rejected by validation")
+
+        if validated and code_map_path:
+            group_save_name = f"{prefix}-{group['name']}" if not group["name"].startswith(prefix) else group["name"]
+            out_file = save_test_cases(code_map_path, group_save_name, validated, existing_filenames)
+            all_saved_files.append(out_file)
+            total_test_cases += len(validated)
+
+    if not all_saved_files and not total_test_cases:
+        active_provider = get_active_provider_name()
+        detail_suffix = f": {'; '.join(set(generation_failures))}" if generation_failures else ""
+        raise ValueError(f"LLM provider {active_provider} did not produce valid {norm_type} test cases{detail_suffix}.")
+
+    return {
+        "status": "success",
+        "alreadyExists": False,
+        "savedFiles": [f.name for f in all_saved_files],
+        "testCaseCount": total_test_cases,
+        "unitCount": len(targets),
+        "message": f"{norm_type.capitalize()} test cases generated successfully ({total_test_cases} test cases across {len(all_saved_files)} file(s)).",
+        "testType": norm_type,
     }
 
 

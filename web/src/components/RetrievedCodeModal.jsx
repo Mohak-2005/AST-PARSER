@@ -40,17 +40,27 @@ export default function RetrievedCodeModal({
     if (!currentFile || !currentFile.content) return [];
     const content = currentFile.content;
     if (Array.isArray(content.testCases) && content.testCases.length > 0) {
-      return content.testCases;
+      return content.testCases.map((tc) => ({
+        ...tc,
+        testType: tc.testType || content.testType || 'unit',
+        route: tc.route || tc.target?.route || content.route,
+        httpMethod: tc.httpMethod || tc.target?.httpMethod || content.httpMethod,
+      }));
     }
     // Fallback: single test case structure
     if (content.testCaseId) {
       return [
         {
           testCaseId: content.testCaseId,
+          testType: content.testType || content.target?.testType || 'unit',
+          route: content.route || content.target?.route,
+          httpMethod: content.httpMethod || content.target?.httpMethod,
           title: content.group || currentFile.fileName,
           target: content.target || {
             file: content.retrieval?.primaryFile,
-            symbol: content.retrieval?.primarySymbol
+            symbol: content.retrieval?.primarySymbol,
+            route: content.route,
+            httpMethod: content.httpMethod,
           },
           retrieval: content.retrieval,
           source: content.source,
@@ -124,7 +134,7 @@ export default function RetrievedCodeModal({
                 </span>
               </h2>
               <p className="text-xs text-slate-400">
-                Minimum sufficient source code retrieved by Local Agent for unit test implementation
+                Minimum sufficient source code retrieved by Local Agent for test implementation
               </p>
             </div>
           </div>
@@ -176,6 +186,7 @@ export default function RetrievedCodeModal({
                 filteredFiles.map((file, fIdx) => {
                   const isSelected = files.indexOf(file) === selectedFileIdx;
                   const count = file.content?.testCases?.length || 1;
+                  const topType = (file.content?.testType || file.content?.testCases?.[0]?.testType || 'unit').toLowerCase();
                   return (
                     <div key={file.fileName} className="space-y-0.5">
                       <button
@@ -193,30 +204,55 @@ export default function RetrievedCodeModal({
                           <FileCode className="w-3.5 h-3.5 flex-shrink-0 text-slate-400" />
                           <span className="truncate">{file.fileName}</span>
                         </div>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
-                          {count}
-                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[9px] px-1.5 py-0.2 rounded font-mono font-semibold uppercase ${
+                            topType === 'api'
+                              ? 'bg-amber-500/20 text-amber-300'
+                              : topType === 'functional'
+                              ? 'bg-cyan-500/20 text-cyan-300'
+                              : 'bg-emerald-500/20 text-emerald-300'
+                          }`}>
+                            {topType === 'api' ? 'API' : topType === 'functional' ? 'FUNC' : 'UNIT'}
+                          </span>
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                            {count}
+                          </span>
+                        </div>
                       </button>
 
                       {/* Sub-cases list if current file selected */}
                       {isSelected && testCases.length > 1 && (
                         <div className="pl-4 pr-1 py-1 space-y-1 border-l-2 border-indigo-500/30 ml-3">
-                          {testCases.map((tc, cIdx) => (
-                            <button
-                              key={tc.testCaseId || cIdx}
-                              onClick={() => setSelectedCaseIdx(cIdx)}
-                              className={`w-full text-left px-2 py-1 rounded text-[11px] truncate flex items-center justify-between transition-colors ${
-                                selectedCaseIdx === cIdx
-                                  ? 'bg-indigo-600/30 text-indigo-200 font-medium'
-                                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
-                              }`}
-                            >
-                              <span className="truncate">{tc.testCaseId || `TC-${cIdx + 1}`}</span>
-                              <span className="text-[9px] text-slate-500 uppercase">
-                                {tc.retrieval?.status || 'ok'}
-                              </span>
-                            </button>
-                          ))}
+                          {testCases.map((tc, cIdx) => {
+                            const subType = (tc.testType || topType).toLowerCase();
+                            return (
+                              <button
+                                key={tc.testCaseId || cIdx}
+                                onClick={() => setSelectedCaseIdx(cIdx)}
+                                className={`w-full text-left px-2 py-1 rounded text-[11px] truncate flex items-center justify-between transition-colors ${
+                                  selectedCaseIdx === cIdx
+                                    ? 'bg-indigo-600/30 text-indigo-200 font-medium'
+                                    : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+                                }`}
+                              >
+                                <span className="truncate">{tc.testCaseId || `TC-${cIdx + 1}`}</span>
+                                <div className="flex items-center gap-1">
+                                  <span className={`text-[8px] px-1 rounded font-mono ${
+                                    subType === 'api'
+                                      ? 'bg-amber-500/20 text-amber-300'
+                                      : subType === 'functional'
+                                      ? 'bg-cyan-500/20 text-cyan-300'
+                                      : 'bg-emerald-500/20 text-emerald-300'
+                                  }`}>
+                                    {subType === 'api' ? 'API' : subType === 'functional' ? 'FUNC' : 'UNIT'}
+                                  </span>
+                                  <span className="text-[9px] text-slate-500 uppercase">
+                                    {tc.retrieval?.status || 'ok'}
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
                         </div>
                       )}
                     </div>
@@ -246,6 +282,20 @@ export default function RetrievedCodeModal({
                       <span className="text-sm font-semibold text-slate-100">
                         {activeTestCase.title || currentFile?.fileName}
                       </span>
+                      {(() => {
+                        const tcType = (activeTestCase.testType || currentFile?.content?.testType || 'unit').toLowerCase();
+                        return (
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider border ${
+                            tcType === 'api'
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                              : tcType === 'functional'
+                              ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                              : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          }`}>
+                            {tcType === 'api' ? 'API' : tcType === 'functional' ? 'FUNC' : 'UNIT'}
+                          </span>
+                        );
+                      })()}
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -282,8 +332,8 @@ export default function RetrievedCodeModal({
                     </div>
                     <div>
                       <span className="text-slate-500">Test Type: </span>
-                      <span className="capitalize text-slate-300">
-                        {activeTestCase.testType || 'unit'}
+                      <span className="capitalize font-semibold text-slate-300">
+                        {activeTestCase.testType || currentFile?.content?.testType || 'unit'}
                       </span>
                     </div>
                     <div>
@@ -292,6 +342,18 @@ export default function RetrievedCodeModal({
                         {currentFile?.fileName || 'N/A'}
                       </span>
                     </div>
+
+                    {/* API route/method banner if applicable */}
+                    {(activeTestCase.target?.route || activeTestCase.route || currentFile?.content?.route || currentFile?.content?.target?.route) && (
+                      <div className="col-span-1 md:col-span-2 flex items-center gap-2 bg-slate-900/90 p-2 rounded-lg border border-amber-500/30 mt-1">
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono font-bold uppercase">
+                          {activeTestCase.target?.httpMethod || activeTestCase.httpMethod || currentFile?.content?.httpMethod || 'ANY'}
+                        </span>
+                        <span className="font-mono text-xs text-amber-200">
+                          {activeTestCase.target?.route || activeTestCase.route || currentFile?.content?.route || currentFile?.content?.target?.route}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Warnings alert if present */}

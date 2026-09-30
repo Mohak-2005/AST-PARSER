@@ -653,14 +653,19 @@ def validate_target_identity(
     Returns (is_valid, failure_type, explanation).
     """
     target = test_case.get("target") or test_case.get("unit") or {}
-    tc_file = target.get("file", "").strip()
-    tc_symbol = target.get("symbol", "").strip()
+    if not isinstance(target, dict):
+        target = {}
+    raw_tc_file = target.get("file")
+    tc_file = str(raw_tc_file).strip() if raw_tc_file is not None else ""
+    raw_tc_sym = target.get("symbol")
+    tc_symbol = str(raw_tc_sym).strip() if raw_tc_sym is not None else ""
 
     # 1. Validate target file
     # Check test_case specific retrieval and source first, then fallback to retrieved_data
-    tc_retrieval = test_case.get("retrieval") or {}
-    rd_retrieval = retrieved_data.get("retrieval") or {}
-    primary_file = tc_retrieval.get("primaryFile", "").strip() or rd_retrieval.get("primaryFile", "").strip()
+    tc_retrieval = test_case.get("retrieval") if isinstance(test_case.get("retrieval"), dict) else {}
+    rd_retrieval = retrieved_data.get("retrieval") if isinstance(retrieved_data.get("retrieval"), dict) else {}
+    raw_pfile = tc_retrieval.get("primaryFile") or rd_retrieval.get("primaryFile")
+    primary_file = str(raw_pfile).strip() if raw_pfile is not None else ""
 
     tc_source_files = test_case.get("source", {}).get("files", [])
     rd_source_files = retrieved_data.get("source", {}).get("files", [])

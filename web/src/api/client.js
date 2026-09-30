@@ -79,3 +79,17 @@ export const generateTestScripts = (params) =>
     typeof params === 'string' ? { codeMapPath: params } : params
   );
 
+// Triggers Test Execution Runner service for the current project.
+export const executeTests = (params) =>
+  backendApi.post(
+    '/api/test-execution',
+    typeof params === 'string' ? { codeMapPath: params } : params
+  );
+
+// Checks existing Test Execution results for the current project.
+export const checkTestExecution = (params) =>
+  backendApi.get('/api/test-execution', {
+    params: typeof params === 'string' ? { codeMapPath: params } : params,
+  });
+
+

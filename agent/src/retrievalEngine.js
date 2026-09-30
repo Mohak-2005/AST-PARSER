@@ -412,10 +412,19 @@ async function retrieveCodeForProject(options = {}) {
           }
         }
 
+        if (!symbolDecl && target.route && Array.isArray(codeMapEntry.routes)) {
+          const rMatch = codeMapEntry.routes.find(
+            (r) => (r.path === target.route || r.route === target.route)
+          );
+          if (rMatch) {
+            symbolDecl = { name: rMatch.handler || targetSymbol || rMatch.path, line: rMatch.line, type: 'route' };
+          }
+        }
+
         if (!symbolDecl) {
           retrievalStatus = 'partially_resolved';
           warnings.push(
-            `Target file found, but target symbol '${targetSymbol}' was not found in Code Map declarations.`
+            `Target file found, but target symbol '${targetSymbol || target.route}' was not found in Code Map declarations.`
           );
         }
       }
@@ -498,7 +507,9 @@ async function retrieveCodeForProject(options = {}) {
         target: {
           file: targetFileRaw,
           symbol: targetSymbol,
-          type: targetType
+          type: targetType,
+          route: target.route || null,
+          httpMethod: target.httpMethod || null
         },
         retrieval: {
           status: retrievalStatus,
@@ -532,6 +543,7 @@ async function retrieveCodeForProject(options = {}) {
     const retrievedFileContent = {
       testCaseId: firstCase.testCaseId || 'TC-001',
       group: rawContent.group || rawContent.title || 'Unit Tests',
+      testType: firstCase.testType || 'unit',
       source: firstCase.source || { files: [] },
       metadata: firstCase.metadata || { relatedFiles: [], relatedSymbols: [], dependencyDepth: 0 },
       retrieval: firstCase.retrieval || { status: 'resolved' },

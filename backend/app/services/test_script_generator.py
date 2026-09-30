@@ -22,6 +22,13 @@ from app.services.source_target_inspector import (
     inspect_source_target,
     validate_target_identity,
 )
+from app.services.import_resolver import (
+    classify_import,
+    detect_subproject_root,
+    detect_js_module_system,
+    resolve_project_local_import,
+    validate_script_imports,
+)
 
 logger = logging.getLogger("test_script_generator")
 
@@ -126,20 +133,12 @@ def resolve_target_import(
     if lang_lower in ["javascript", "typescript", "jsx", "tsx", "js", "ts"]:
         try:
             rel = os.path.relpath(source_file_abs, script_dir_abs)
+            rel_posix = rel.replace("\\", "/")
+            if not rel_posix.startswith("."):
+                rel_posix = f"./{rel_posix}"
         except ValueError:
-            return {
-                "resolved": False,
-                "import_specifier": "",
-                "import_statement": "",
-                "target_file_path": str(source_file_abs),
-                "is_default_export": False,
-                "is_named_export": False,
-                "error": f"Cannot resolve relative import between different drive letters: {source_file_abs} and {script_dir_abs}.",
-            }
-
-        rel_posix = rel.replace("\\", "/")
-        if not rel_posix.startswith("."):
-            rel_posix = f"./{rel_posix}"
+            # Different drive letters on Windows: fallback to absolute posix path
+            rel_posix = source_file_abs.as_posix()
 
         # Strip standard extensions for JS/TS import specifiers
         import_specifier = re.sub(r"\.(tsx|ts|jsx|js)$", "", rel_posix)
@@ -160,10 +159,19 @@ def resolve_target_import(
             else:
                 is_named = True
 
-        if is_default:
-            stmt = f"import {target_symbol} from '{import_specifier}';"
+        p_root = Path(project_root).resolve() if project_root else None
+        is_esm = detect_js_module_system(source_file_abs, p_root, source_code) == "esm"
+
+        if is_esm:
+            if is_default:
+                stmt = f"import {target_symbol} from '{import_specifier}';"
+            else:
+                stmt = f"import {{ {target_symbol} }} from '{import_specifier}';"
         else:
-            stmt = f"import {{ {target_symbol} }} from '{import_specifier}';"
+            if is_default:
+                stmt = f"const {target_symbol} = require('{import_specifier}');"
+            else:
+                stmt = f"const {{ {target_symbol} }} = require('{import_specifier}');"
 
         return {
             "resolved": True,
@@ -172,6 +180,7 @@ def resolve_target_import(
             "target_file_path": str(source_file_abs),
             "is_default_export": is_default,
             "is_named_export": is_named,
+            "is_esm": is_esm,
             "error": None,
         }
 
@@ -372,19 +381,29 @@ def build_script_generation_prompt(
     Only permitted structural metadata (symbol names, prop/param names, method names)
     and Test Case specifications are transmitted to the cloud LLM.
     """
-    tc_id = test_case.get("testCaseId", "TC-001")
-    title = test_case.get("title", "")
-    description = test_case.get("description", "")
+    raw_tc_id = test_case.get("testCaseId") if isinstance(test_case, dict) else None
+    tc_id = str(raw_tc_id).strip() if raw_tc_id is not None and str(raw_tc_id).strip() else "TC-001"
+    raw_title = test_case.get("title") if isinstance(test_case, dict) else None
+    title = str(raw_title).strip() if raw_title is not None else ""
+    raw_desc = test_case.get("description") if isinstance(test_case, dict) else None
+    description = str(raw_desc).strip() if raw_desc is not None else ""
     target = test_case.get("target") or test_case.get("unit") or {}
-    target_file = target.get("file", "")
-    target_symbol = target.get("symbol", "")
-    target_type = target.get("type", "unit")
-    inputs = test_case.get("inputs", {})
-    expected_result = test_case.get("expectedResult", "")
+    if not isinstance(target, dict):
+        target = {}
+    raw_target_file = target.get("file")
+    target_file = str(raw_target_file).strip() if raw_target_file is not None else ""
+    raw_target_symbol = target.get("symbol")
+    target_symbol = str(raw_target_symbol).strip() if raw_target_symbol is not None else ""
+    raw_target_type = target.get("type")
+    target_type = str(raw_target_type).strip() if raw_target_type is not None else "unit"
+    inputs = test_case.get("inputs", {}) if isinstance(test_case, dict) else {}
+    raw_expected = test_case.get("expectedResult") if isinstance(test_case, dict) else None
+    expected_result = str(raw_expected).strip() if raw_expected is not None else ""
 
     lang = project_env.language
     framework = project_env.test_framework
     ext = project_env.file_extension
+    comment_marker = "//" if lang in ["java", "javascript", "typescript", "go", "rust", "c_sharp", "cpp"] else "#"
 
     # Use descriptor if provided, or inspect locally
     if not descriptor:
@@ -409,10 +428,10 @@ def build_script_generation_prompt(
         "- Construct the smallest valid inputs required for the test based strictly on these observed parameters/props.\n"
         "- Generate ONLY pure, executable test code. No explanations, no markdown intro, no outro.\n"
         "- Enforce ONE TEST CASE → ONE CLEAN STANDALONE TEST SCRIPT.\n"
-        f"- Preserve the Test Case metadata at the very top of the script:\n"
-        f"  Test Case ID: {tc_id}\n"
-        f"  Test Case Title: {title}\n"
-        f"  Target: {target_file}::{target_symbol}\n"
+        f"- Preserve the Test Case metadata as header comments at the very top of the script:\n"
+        f"  {comment_marker} Test Case ID: {tc_id}\n"
+        f"  {comment_marker} Test Case Title: {title}\n"
+        f"  {comment_marker} Target: {target_file}::{target_symbol}\n"
     )
 
     if resolved_import and resolved_import.get("import_statement"):
@@ -475,13 +494,45 @@ def build_script_generation_prompt(
         elif actual_ext in [".tsx", ".jsx"]:
             system_prompt += f"- Render component using JSX syntax with {framework} and React Testing Library conventions.\n"
 
+    raw_tt = test_case.get("testType") or (retrieved_data.get("testType") if isinstance(retrieved_data, dict) else None) or "unit"
+    test_type = str(raw_tt).strip().lower() if raw_tt is not None else "unit"
+    if test_type in ("functional", "e2e"):
+        system_prompt += (
+            "\nFUNCTIONAL / WORKFLOW TEST REQUIREMENTS:\n"
+            "- Test component interactions, state transitions, and expected DOM/rendered outcomes.\n"
+            "- Use accessible queries (getByRole, getByText, getByLabelText) without inventing arbitrary selectors.\n"
+        )
+    elif test_type == "api":
+        tc_target = test_case.get("target") if isinstance(test_case.get("target"), dict) else (test_case.get("unit") if isinstance(test_case.get("unit"), dict) else {})
+        route_val = str(tc_target.get("route") or tc_target.get("endpoint") or tc_target.get("path") or "")
+        method_val = str(tc_target.get("httpMethod") or "GET").upper()
+        system_prompt += (
+            "\nAPI / ENDPOINT TEST REQUIREMENTS:\n"
+            f"- This is an API test for route: '{route_val}', HTTP Method: '{method_val}'.\n"
+            "- Use the project's detected framework and appropriate HTTP test client:\n"
+            "  * Python: TestClient(app), app.test_client(), or httpx/requests.\n"
+            "  * JavaScript/TypeScript: supertest(app) or fetch.\n"
+            "  * Java: MockMvc or RestAssured.\n"
+            "  * Go: net/http/httptest.\n"
+            "- Ground requests strictly in the specified endpoint path and HTTP method.\n"
+            "- Assert HTTP status codes (e.g. 200, 201, 400, 404, 500) and response payload structure matching the Test Case.\n"
+        )
+
+    api_extra = ""
+    if test_type == "api":
+        r_val = test_case.get("unit", {}).get("route") or test_case.get("target", {}).get("route") or ""
+        m_val = test_case.get("unit", {}).get("httpMethod") or test_case.get("target", {}).get("httpMethod") or "GET"
+        if r_val:
+            api_extra = f"\nTarget Route: {r_val}\nTarget HTTP Method: {m_val}"
+
     user_content = (
         f"=== TEST CASE SPECIFICATION ===\n"
         f"Test Case ID: {tc_id}\n"
+        f"Test Type: {test_type}\n"
         f"Title: {title}\n"
         f"Description: {description}\n"
         f"Target File: {target_file}\n"
-        f"Target Symbol: {target_symbol} ({target_type})\n"
+        f"Target Symbol: {target_symbol} ({target_type}){api_extra}\n"
         f"Inputs: {json.dumps(inputs) if inputs else 'None'}\n"
         f"Expected Result: {expected_result}\n\n"
         f"=== DETERMINISTIC TARGET IDENTITY & STRUCTURAL METADATA ===\n"
@@ -622,8 +673,12 @@ def _check_expected_result_alignment(code: str, test_case: dict, language: str =
     Verifies that if the Test Case specifies an error/exception scenario or expectedResult,
     the generated test script actually asserts an error, exception, or failure.
     """
-    expected_result = (test_case.get("expectedResult") or "").strip()
-    scenario_type = (test_case.get("scenarioType") or test_case.get("type") or "").lower()
+    if not isinstance(test_case, dict):
+        return None
+    raw_exp = test_case.get("expectedResult")
+    expected_result = str(raw_exp).strip() if raw_exp is not None else ""
+    raw_scen = test_case.get("scenarioType") or test_case.get("type")
+    scenario_type = str(raw_scen).strip().lower() if raw_scen is not None else ""
     is_error_scenario = (
         bool(re.search(r"\b(raises?|throws?|throw|exception|error\b|rejected|rejects)\b", expected_result, re.IGNORECASE))
         and not bool(re.search(r"\b(no\s+error|without\s+error|should\s+not\s+throw|valid)\b", expected_result, re.IGNORECASE))
@@ -655,7 +710,11 @@ def _check_unit_test_isolation(code: str, test_case: dict) -> Optional[str]:
     """
     Ensures unit tests do not make unmocked live external network or database calls.
     """
-    test_type = (test_case.get("testType") or test_case.get("target", {}).get("type") or "unit").lower()
+    if not isinstance(test_case, dict):
+        return None
+    tc_target = test_case.get("target") if isinstance(test_case.get("target"), dict) else (test_case.get("unit") if isinstance(test_case.get("unit"), dict) else {})
+    raw_type = test_case.get("testType") or tc_target.get("type") or "unit"
+    test_type = str(raw_type).strip().lower() if raw_type is not None else "unit"
     if test_type != "unit":
         return None
 
@@ -682,9 +741,16 @@ def _check_unit_test_isolation(code: str, test_case: dict) -> Optional[str]:
 
 def _check_test_type_compatibility(code: str, test_case: dict) -> Optional[str]:
     """
-    Enforces test type boundaries (e.g. unit tests must not use browser automation).
+    Enforces test type boundaries:
+    - unit tests must not use browser automation
+    - api tests must assert HTTP response/status codes and not use browser automation
+    - functional tests focus on user workflow/DOM assertions
     """
-    test_type = (test_case.get("testType") or test_case.get("target", {}).get("type") or "unit").lower()
+    if not isinstance(test_case, dict):
+        return None
+    tc_target = test_case.get("target") if isinstance(test_case.get("target"), dict) else (test_case.get("unit") if isinstance(test_case.get("unit"), dict) else {})
+    raw_type = test_case.get("testType") or tc_target.get("type") or "unit"
+    test_type = str(raw_type).strip().lower() if raw_type is not None else "unit"
     if test_type == "unit":
         e2e_patterns = [
             r"\b(from\s+playwright|import\s+playwright|require\s*\(\s*['\"]playwright)\b",
@@ -695,6 +761,31 @@ def _check_test_type_compatibility(code: str, test_case: dict) -> Optional[str]:
             m = re.search(pat, code, re.IGNORECASE)
             if m:
                 return f"Unit test contains browser automation tool ('{m.group(0).strip()}'). Browser automation is reserved for end-to-end (e2e) tests."
+    elif test_type == "api":
+        e2e_patterns = [
+            r"\b(from\s+playwright|import\s+playwright|require\s*\(\s*['\"]playwright)\b",
+            r"\b(from\s+selenium|import\s+selenium|require\s*\(\s*['\"]selenium)\b",
+            r"\b(puppeteer|cypress)\b",
+        ]
+        for pat in e2e_patterns:
+            m = re.search(pat, code, re.IGNORECASE)
+            if m:
+                return f"API test contains browser automation tool ('{m.group(0).strip()}'). API tests should use HTTP test clients."
+        status_patterns = [
+            r"\bstatus_code\b",
+            r"\bstatusCode\b",
+            r"\.status\s*\(",
+            r"\.status\s*==",
+            r"\.status\s*===",
+            r"\bexpect\s*\([^)]*\.status",
+            r"\.getStatusCode\s*\(",
+            r"\bstatus\b",
+            r"\b200\b|\b201\b|\b400\b|\b404\b|\b500\b",
+            r"\bassert\s+[a-zA-Z0-9_.]+\s*(?:==|!=)",
+        ]
+        has_status_check = any(re.search(pat, code) for pat in status_patterns)
+        if not has_status_check:
+            return "API test script does not assert any HTTP status code or response status."
     return None
 
 
@@ -702,6 +793,7 @@ def _check_mock_target_grounding(code: str, source_code: str, descriptor: Option
     """
     Verifies that mocks target symbols actually present in the retrieved module or descriptor.
     """
+    source_code_str = str(source_code or "")
     patch_matches = re.finditer(r'(?:@patch|mock\.patch)\s*\(\s*["\']([^"\']+)["\']', code)
     for pm in patch_matches:
         patch_path = pm.group(1)
@@ -710,10 +802,10 @@ def _check_mock_target_grounding(code: str, source_code: str, descriptor: Option
         parts = patch_path.split(".")
         if len(parts) >= 2:
             leaf_symbol = parts[-1]
-            in_source = bool(source_code and leaf_symbol.lower() in source_code.lower())
-            in_methods = bool(descriptor and any(m.lower() == leaf_symbol.lower() for m in descriptor.observed_methods))
-            in_exports = bool(descriptor and any(e.lower() == leaf_symbol.lower() for e in descriptor.exported_symbols))
-            in_params = bool(descriptor and any(p.lower() == leaf_symbol.lower() for p in descriptor.observed_props_or_params))
+            in_source = bool(source_code_str and leaf_symbol.lower() in source_code_str.lower())
+            in_methods = bool(descriptor and any(str(m).lower() == leaf_symbol.lower() for m in descriptor.observed_methods if m is not None))
+            in_exports = bool(descriptor and any(str(e).lower() == leaf_symbol.lower() for e in descriptor.exported_symbols if e is not None))
+            in_params = bool(descriptor and any(str(p).lower() == leaf_symbol.lower() for p in descriptor.observed_props_or_params if p is not None))
             if not (in_source or in_methods or in_exports or in_params):
                 return f"Mock target '{patch_path}' patches symbol '{leaf_symbol}' which does not exist in the retrieved source code or target descriptor."
     return None
@@ -723,24 +815,38 @@ def _check_test_case_conflicts(code: str, tc_id: str, retrieved_data: dict) -> O
     """
     Detects conflicting Test Case IDs in multi-case retrieved groups.
     """
-    test_cases = retrieved_data.get("testCases", [])
-    if len(test_cases) > 1:
-        other_tc_ids = {
-            tc.get("testCaseId").strip()
-            for tc in test_cases
-            if tc.get("testCaseId") and tc.get("testCaseId").strip() != tc_id
-        }
-        m_hdr = re.search(r"(?://|#)\s*Test Case ID:\s*([A-Za-z0-9_-]+)", code)
-        if m_hdr:
-            declared_id = m_hdr.group(1).strip()
-            if declared_id in other_tc_ids and declared_id != tc_id:
-                return f"Conflicting Test Case ID: script header declares '{declared_id}' but current test case is '{tc_id}'."
-        clean_current = re.sub(r"[^a-zA-Z0-9]", "", tc_id).lower()
-        if clean_current not in code.lower():
+    if not isinstance(retrieved_data, dict):
+        return None
+    test_cases = retrieved_data.get("testCases")
+    if not isinstance(test_cases, list) or len(test_cases) <= 1:
+        return None
+
+    safe_tc_id = str(tc_id or "").strip()
+    other_tc_ids = set()
+    for tc in test_cases:
+        if isinstance(tc, dict):
+            raw_id = tc.get("testCaseId")
+            if raw_id is not None:
+                tid = str(raw_id).strip()
+                if tid and tid != safe_tc_id:
+                    other_tc_ids.add(tid)
+
+    if not other_tc_ids:
+        return None
+
+    m_hdr = re.search(r"(?://|#)\s*Test Case ID:\s*([A-Za-z0-9_-]+)", code)
+    if m_hdr:
+        declared_id = m_hdr.group(1).strip()
+        if declared_id in other_tc_ids and declared_id != safe_tc_id:
+            return f"Conflicting Test Case ID: script header declares '{declared_id}' but current test case is '{safe_tc_id}'."
+
+    if safe_tc_id:
+        clean_current = re.sub(r"[^a-zA-Z0-9]", "", safe_tc_id).lower()
+        if clean_current and clean_current not in code.lower():
             for other_id in other_tc_ids:
                 clean_other = re.sub(r"[^a-zA-Z0-9]", "", other_id).lower()
-                if clean_other in code.lower():
-                    return f"Conflicting Test Case ID: script targets '{other_id}' instead of '{tc_id}'."
+                if clean_other and clean_other in code.lower():
+                    return f"Conflicting Test Case ID: script targets '{other_id}' instead of '{safe_tc_id}'."
     return None
 
 
@@ -748,12 +854,13 @@ def _check_prop_grounding(code: str, target_symbol: str, descriptor: Optional[Ta
     """
     Verifies that JSX components are not passed ungrounded props that do not exist in source.
     """
-    if not descriptor or not descriptor.observed_props_or_params:
+    if not target_symbol or not descriptor or not descriptor.observed_props_or_params:
         return None
-    observed = {p.lower() for p in descriptor.observed_props_or_params}
+    observed = {str(p).lower() for p in descriptor.observed_props_or_params if p is not None}
     if any(p in observed for p in ["props", "...rest", "rest", "args", "*args", "**kwargs"]):
         return None
 
+    source_code_str = str(source_code or "")
     jsx_pattern = re.compile(rf"<{re.escape(target_symbol)}\b([^>]*)/?>")
     for m in jsx_pattern.finditer(code):
         attrs_str = m.group(1)
@@ -765,7 +872,7 @@ def _check_prop_grounding(code: str, target_symbol: str, descriptor: Optional[Ta
         for prop in passed_props:
             prop_l = prop.lower()
             if prop_l not in observed and prop_l not in standard_props:
-                if source_code and prop_l in source_code.lower():
+                if source_code_str and prop_l in source_code_str.lower():
                     continue
                 return f"Component '{target_symbol}' is passed ungrounded prop '{prop}' that is not defined in the source code or observed props ({descriptor.observed_props_or_params})."
     return None
@@ -830,11 +937,16 @@ def validate_generated_script(
         failure_type = failure_type or "SCRIPT_SYNTAX_ERROR"
 
     # 5. Test Case Mapping & Conflicting IDs
-    tc_id = test_case.get("testCaseId", "").strip()
+    raw_tc_id = test_case.get("testCaseId") if isinstance(test_case, dict) else None
+    tc_id = str(raw_tc_id).strip() if raw_tc_id is not None else ""
     cleaned_lower = cleaned.lower()
-    tc_id_clean = re.sub(r"[^a-zA-Z0-9]", "", tc_id).lower()
-    if tc_id and (tc_id.lower() not in cleaned_lower and tc_id_clean not in cleaned_lower):
-        errors.append(f"Test Case ID '{tc_id}' was not preserved in comments, class name, or test name.")
+    if tc_id:
+        tc_id_clean = re.sub(r"[^a-zA-Z0-9]", "", tc_id).lower()
+        if tc_id.lower() not in cleaned_lower and (tc_id_clean and tc_id_clean not in cleaned_lower):
+            errors.append(f"Test Case ID '{tc_id}' was not preserved in comments, class name, or test name.")
+            failure_type = failure_type or "TEST_CASE_SOURCE_MISMATCH"
+    else:
+        errors.append("Test case is missing required 'testCaseId'.")
         failure_type = failure_type or "TEST_CASE_SOURCE_MISMATCH"
 
     conflict_err = _check_test_case_conflicts(cleaned, tc_id, retrieved_data)
@@ -844,22 +956,55 @@ def validate_generated_script(
 
     # 6. Target Mapping & Cross-Target Substitution Guard
     target = test_case.get("target") or test_case.get("unit") or {}
-    target_symbol = target.get("symbol", "").strip()
-    target_file = target.get("file", "").strip()
+    if not isinstance(target, dict):
+        target = {}
+
+    raw_symbol = target.get("symbol")
+    target_symbol = str(raw_symbol).strip() if raw_symbol is not None else ""
+
+    raw_file = target.get("file")
+    target_file = str(raw_file).strip() if raw_file is not None else ""
+
+    raw_route = target.get("route") or target.get("endpoint") or target.get("path")
+    target_route = str(raw_route).strip() if raw_route is not None else ""
+
+    raw_test_type = (
+        test_case.get("testType")
+        or target.get("testType")
+        or (retrieved_data.get("testType") if isinstance(retrieved_data, dict) else None)
+        or "unit"
+    )
+    test_type = str(raw_test_type).strip().lower() if raw_test_type is not None else "unit"
+
+    if test_type == "api":
+        if not target_route:
+            errors.append("API test case is missing required 'route' in target metadata.")
+            failure_type = failure_type or "TARGET_MISMATCH"
+        else:
+            route_clean = target_route.lower()
+            route_no_slash = route_clean.replace("/", "")
+            if route_clean not in cleaned_lower and route_no_slash not in cleaned_lower:
+                errors.append(f"API test script does not target expected route '{target_route}'.")
+                failure_type = failure_type or "TARGET_MISMATCH"
 
     symbol_found = False
     if target_symbol:
         symbol_found = target_symbol.lower() in cleaned_lower
+    elif target_route:
+        symbol_found = target_route.lower() in cleaned_lower or target_route.replace("/", "").lower() in cleaned_lower
+
+    if not symbol_found and target_route:
+        symbol_found = target_route.lower() in cleaned_lower or target_route.replace("/", "").lower() in cleaned_lower
 
     if not symbol_found and descriptor and descriptor.exported_symbols:
-        symbol_found = any(exp.lower() in cleaned_lower for exp in descriptor.exported_symbols)
+        symbol_found = any(str(exp).lower() in cleaned_lower for exp in descriptor.exported_symbols if exp is not None)
 
-    if target_symbol and not symbol_found:
+    if target_symbol and not symbol_found and not (target_route and target_route.lower() in cleaned_lower):
         errors.append(f"Target symbol '{target_symbol}' was not found in generated script.")
         failure_type = failure_type or "TARGET_MISMATCH"
 
     if descriptor and descriptor.target_symbol:
-        if not symbol_found:
+        if not symbol_found and not (target_route and target_route.lower() in cleaned_lower):
             errors.append(f"Cross-target substitution detected: target is '{descriptor.target_symbol}', but script does not test it.")
             failure_type = "TARGET_MISMATCH"
 
@@ -893,32 +1038,47 @@ def validate_generated_script(
                                 )
                                 failure_type = failure_type or "IMPORT_RESOLUTION_ERROR"
 
-        effective_ext = script_extension or project_env.file_extension
-        has_jsx_in_code = bool(
-            re.search(
-                r"<[A-Z][a-zA-Z0-9_]*(\s+[^>]*)?(?:/>|>)|</[a-zA-Z0-9_]+>|<(div|span|button|p|h[1-6]|ul|li|input|form)\b[^>]*>",
-                cleaned,
-            )
+    # Multi-language project-local import validation
+    if script_dir:
+        dummy_script_path = Path(script_dir) / f"test_{re.sub(r'[^a-zA-Z0-9_]', '_', tc_id or 'TC')}{script_extension or project_env.file_extension}"
+        val_imp = validate_script_imports(
+            script_path=dummy_script_path,
+            project_root=Path(project_env.project_root) if project_env.project_root else None,
+            language=lang,
+            project_env=project_env,
+            script_content=cleaned,
+            target_file=target_file,
         )
-        has_ts_in_code = bool(
-            re.search(
-                r"\bas\s+any\b|\bas\s+(string|number|boolean|unknown|never|[A-Z][a-zA-Z0-9_]*)\b|:\s*(React\.[A-Z]|string|number|boolean|Record<|Array<)|\binterface\s+[A-Z]|\btype\s+[A-Z][a-zA-Z0-9_]*\s*=",
-                cleaned,
-            )
+        if not val_imp["valid"] and val_imp.get("failureType") == "IMPORT_RESOLUTION_ERROR":
+            errors.append(val_imp["reason"])
+            failure_type = failure_type or "IMPORT_RESOLUTION_ERROR"
+
+    effective_ext = script_extension or project_env.file_extension
+    has_jsx_in_code = bool(
+        re.search(
+            r"<[A-Z][a-zA-Z0-9_]*(\s+[^>]*)?(?:/>|>)|</[a-zA-Z0-9_]+>|<(div|span|button|p|h[1-6]|ul|li|input|form)\b[^>]*>",
+            cleaned,
         )
+    )
+    has_ts_in_code = bool(
+        re.search(
+            r"\bas\s+any\b|\bas\s+(string|number|boolean|unknown|never|[A-Z][a-zA-Z0-9_]*)\b|:\s*(React\.[A-Z]|string|number|boolean|Record<|Array<)|\binterface\s+[A-Z]|\btype\s+[A-Z][a-zA-Z0-9_]*\s*=",
+            cleaned,
+        )
+    )
 
-        if effective_ext == ".js":
-            if has_jsx_in_code and not (project_env and project_env.has_jsx and getattr(project_env, "supports_jsx_in_js", False)):
-                errors.append("Script contains JSX syntax but file extension is .js. JSX must be saved in .jsx or .tsx files unless tooling explicitly supports it.")
-                failure_type = failure_type or "SCRIPT_SYNTAX_ERROR"
-            if has_ts_in_code:
-                errors.append("Script contains TypeScript-only syntax ('as any' or type annotations) in an ordinary JavaScript (.js) script.")
-                failure_type = failure_type or "INCOMPATIBLE_SYNTAX"
+    if effective_ext == ".js":
+        if has_jsx_in_code and not (project_env and project_env.has_jsx and getattr(project_env, "supports_jsx_in_js", False)):
+            errors.append("Script contains JSX syntax but file extension is .js. JSX must be saved in .jsx or .tsx files unless tooling explicitly supports it.")
+            failure_type = failure_type or "SCRIPT_SYNTAX_ERROR"
+        if has_ts_in_code:
+            errors.append("Script contains TypeScript-only syntax ('as any' or type annotations) in an ordinary JavaScript (.js) script.")
+            failure_type = failure_type or "INCOMPATIBLE_SYNTAX"
 
-        elif effective_ext == ".ts":
-            if has_jsx_in_code:
-                errors.append("Script contains JSX syntax but file extension is .ts. TSX files must use .tsx extension.")
-                failure_type = failure_type or "SCRIPT_SYNTAX_ERROR"
+    elif effective_ext == ".ts":
+        if has_jsx_in_code:
+            errors.append("Script contains JSX syntax but file extension is .ts. TSX files must use .tsx extension.")
+            failure_type = failure_type or "SCRIPT_SYNTAX_ERROR"
 
     # 7. Source Grounding: Props / Parameters & Instance Methods
     prop_err = _check_prop_grounding(cleaned, target_symbol, descriptor, source_code)
@@ -927,7 +1087,7 @@ def validate_generated_script(
         failure_type = failure_type or "SOURCE_BEHAVIOR_NOT_FOUND"
 
     if descriptor and (descriptor.observed_methods or source_code):
-        check_symbol = (descriptor.target_symbol or target_symbol).strip()
+        check_symbol = str(descriptor.target_symbol or target_symbol or "").strip()
         if check_symbol:
             known_instances = {
                 check_symbol.lower(),
@@ -957,7 +1117,8 @@ def validate_generated_script(
                 if meth_lower in common_safe_methods:
                     continue
                 if recv in known_instances or any(inst in recv for inst in known_instances):
-                    method_in_observed = any(m.lower() == meth_lower for m in descriptor.observed_methods)
+                    observed_list = descriptor.observed_methods if (descriptor and descriptor.observed_methods) else []
+                    method_in_observed = any(str(m).lower() == meth_lower for m in observed_list if m is not None)
                     method_in_source = bool(source_code and meth_lower in source_code.lower())
                     if not method_in_observed and not method_in_source:
                         errors.append(
@@ -1062,12 +1223,18 @@ async def generate_script_for_single_test_case(
     `<target_output_dir>/<Sanitized Title>.<ext>`
     Emits all required diagnostic logs.
     """
-    tc_id = test_case.get("testCaseId", "TC-001")
-    title = test_case.get("title", "") or f"Test_{tc_id}"
+    raw_tc_id = test_case.get("testCaseId") if isinstance(test_case, dict) else None
+    tc_id = str(raw_tc_id).strip() if raw_tc_id is not None and str(raw_tc_id).strip() else "TC-001"
+    raw_title = test_case.get("title") if isinstance(test_case, dict) else None
+    title = str(raw_title).strip() if raw_title is not None and str(raw_title).strip() else f"Test_{tc_id}"
     ext = project_env.file_extension
     target = test_case.get("target") or test_case.get("unit") or {}
-    target_file = target.get("file", "")
-    target_symbol = target.get("symbol", "")
+    if not isinstance(target, dict):
+        target = {}
+    raw_file = target.get("file")
+    target_file = str(raw_file).strip() if raw_file is not None else ""
+    raw_symbol = target.get("symbol")
+    target_symbol = str(raw_symbol).strip() if raw_symbol is not None else ""
 
     # DIAGNOSTIC LOG 1: SCRIPT_GENERATION_STARTED
     backend_logger.info(
@@ -1246,15 +1413,33 @@ async def generate_script_for_single_test_case(
         out_filename = resolve_unique_script_filename(title, tc_id, ext, existing_set, current_tc_id=tc_id)
         out_filepath = target_output_dir / out_filename
 
-    # Reconcile naive relative imports in generated script if LLM made a naive `./<target_symbol>` assumption
-    if import_res.get("resolved") and project_env.language.lower() in ["javascript", "typescript", "jsx", "tsx", "js", "ts"]:
+    # Reconcile naive relative imports in generated script if LLM made a naive assumption
+    if import_res.get("resolved"):
         imp_spec = import_res["import_specifier"]
         stem = Path(target_file).stem
-        for naive_target in [target_symbol, stem]:
-            if naive_target:
+        lang_l = project_env.language.lower()
+        if lang_l in ["javascript", "typescript", "jsx", "tsx", "js", "ts"]:
+            targets_to_reconcile = [t for t in [target_symbol, stem] if t]
+            for naive_target in targets_to_reconcile:
+                esc_target = re.escape(naive_target)
+                from_pat = r"""(from\s+['"])(?:\.{1,2}/|[~@]/|[a-zA-Z0-9_\-\./]+/)?(?:""" + esc_target + r""")(?:/index)?(?:\.(?:tsx|ts|jsx|js|mjs|cjs))?(['"])"""
+                raw_response = re.sub(from_pat, r"\1" + imp_spec + r"\2", raw_response)
+                req_pat = r"""(require\s*\(\s*['"])(?:\.{1,2}/|[~@]/|[a-zA-Z0-9_\-\./]+/)?(?:""" + esc_target + r""")(?:/index)?(?:\.(?:tsx|ts|jsx|js|mjs|cjs))?(['"]\s*\))"""
+                raw_response = re.sub(req_pat, r"\1" + imp_spec + r"\2", raw_response)
+
+            is_esm = import_res.get("is_esm", True)
+            if not is_esm and lang_l not in ["typescript", "ts"]:
+                esc_spec = re.escape(imp_spec)
+                named_pat = r"import\s+\{\s*([^}]+)\s*\}\s+from\s+(['\"]" + esc_spec + r"['\"]);?"
+                raw_response = re.sub(named_pat, r"const { \1 } = require(\2);", raw_response)
+
+                def_pat = r"import\s+([a-zA-Z0-9_$]+)\s+from\s+(['\"]" + esc_spec + r"['\"]);?"
+                raw_response = re.sub(def_pat, r"const \1 = require(\2);", raw_response)
+        elif lang_l == "python":
+            if stem:
                 raw_response = re.sub(
-                    rf"(['\"])\./{re.escape(naive_target)}(?:\.(?:tsx|ts|jsx|js))?(['\"])",
-                    rf"\1{imp_spec}\2",
+                    rf"""from\s+(?:\.{1,2})?{re.escape(stem)}\s+import""",
+                    rf"from {imp_spec} import",
                     raw_response
                 )
 
@@ -1283,6 +1468,17 @@ async def generate_script_for_single_test_case(
         )
 
     if is_valid:
+        # Ensure any top header lines are properly commented if output as raw text
+        script_lines = cleaned_script.splitlines()
+        hdr_modified = False
+        for idx in range(min(5, len(script_lines))):
+            s_line = script_lines[idx].strip()
+            if s_line.startswith("Test Case ID:") or s_line.startswith("Test Case Title:") or s_line.startswith("Target:"):
+                script_lines[idx] = f"{comment_marker} {s_line}"
+                hdr_modified = True
+        if hdr_modified:
+            cleaned_script = "\n".join(script_lines)
+
         # Prepend header if not already there
         if tc_id not in cleaned_script[:200]:
             cleaned_script = header_comment + cleaned_script
@@ -1433,7 +1629,7 @@ def get_existing_test_scripts(code_map_source: Union[str, Path, dict]) -> List[D
                         if test_cases:
                             matched_tc = next((tc for tc in test_cases if tc.get("testCaseId") == tc_id), None)
                             if not matched_tc:
-                                matched_tc = next((tc for tc in test_cases if sanitize_test_title_to_filename(tc.get("title", "")) == script_file.stem), None)
+                                matched_tc = next((tc for tc in test_cases if sanitize_test_title_to_filename(str(tc.get("title") or "")) == script_file.stem), None)
 
                         if matched_tc:
                             # Extract source code for target
@@ -1442,8 +1638,12 @@ def get_existing_test_scripts(code_map_source: Union[str, Path, dict]) -> List[D
                             source_files = tc_source_files if (tc_source_files and isinstance(tc_source_files, list)) else rd_source_files
 
                             target = matched_tc.get("target") or matched_tc.get("unit") or {}
-                            target_file = target.get("file", "")
-                            target_symbol = target.get("symbol", "")
+                            if not isinstance(target, dict):
+                                target = {}
+                            raw_file = target.get("file")
+                            target_file = str(raw_file).strip() if raw_file is not None else ""
+                            raw_symbol = target.get("symbol")
+                            target_symbol = str(raw_symbol).strip() if raw_symbol is not None else ""
                             target_base = Path(target_file).name.lower() if target_file else ""
                             source_code = ""
                             if source_files and isinstance(source_files, list):

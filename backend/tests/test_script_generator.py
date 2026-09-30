@@ -1294,6 +1294,248 @@ def test_sub():
         self.assertEqual(invalid_entry["failureType"], "TRIVIAL_ASSERTION_DETECTED")
         self.assertTrue(len(invalid_entry["errors"]) > 0)
 
+    def test_validation_null_route_unit_test_success(self):
+        """Verify that target with route: null (e.g. Java method addRequest) does not crash and passes validation."""
+        code = """
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+// Test Case ID: TC-001
+class ElevatorSimulationTest {
+    @Test
+    void testAddRequest() {
+        ElevatorSimulation sim = new ElevatorSimulation();
+        sim.addRequest(3);
+        assertTrue(sim.hasRequests());
+    }
+}
+"""
+        tc = {
+            "testCaseId": "TC-001",
+            "title": "Add request to elevator simulation",
+            "testType": "unit",
+            "target": {
+                "file": "ElevatorSimulation.java",
+                "symbol": "addRequest",
+                "type": "method",
+                "route": None,
+                "httpMethod": None,
+            },
+        }
+        retrieved_data = {
+            "testType": "unit",
+            "source": {
+                "files": [
+                    {
+                        "path": "ElevatorSimulation.java",
+                        "reason": "primary_target",
+                        "sourceCode": "class ElevatorSimulation { void addRequest(int floor) {} boolean hasRequests() { return true; } }",
+                    }
+                ]
+            },
+        }
+        desc = TargetDescriptor(
+            target_symbol="addRequest",
+            target_file="ElevatorSimulation.java",
+            observed_props_or_params=["floor"],
+            observed_methods=["addRequest", "hasRequests"],
+            is_symbol_found=True,
+        )
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, retrieved_data, self.env_java, descriptor=desc
+        )
+        self.assertTrue(is_val, f"Validation should succeed but failed with errors: {errs}")
+        self.assertEqual(len(errs), 0)
+        self.assertIsNone(failure_type)
+
+    def test_validation_omitted_route_unit_test_success(self):
+        """Verify that target with route key completely omitted does not crash and passes validation."""
+        code = """
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+// Test Case ID: TC-002
+class ElevatorSimulationTest {
+    @Test
+    void testAddRequest() {
+        ElevatorSimulation sim = new ElevatorSimulation();
+        sim.addRequest(5);
+        assertEquals(5, sim.getFloor());
+    }
+}
+"""
+        tc = {
+            "testCaseId": "TC-002",
+            "title": "Add request to elevator simulation",
+            "testType": "unit",
+            "target": {
+                "file": "ElevatorSimulation.java",
+                "symbol": "addRequest",
+                "type": "method",
+            },
+        }
+        retrieved_data = {
+            "testType": "unit",
+            "source": {
+                "files": [
+                    {
+                        "path": "ElevatorSimulation.java",
+                        "reason": "primary_target",
+                        "sourceCode": "class ElevatorSimulation { void addRequest(int floor) {} int getFloor() { return 5; } }",
+                    }
+                ]
+            },
+        }
+        desc = TargetDescriptor(
+            target_symbol="addRequest",
+            target_file="ElevatorSimulation.java",
+            observed_methods=["addRequest", "getFloor"],
+            is_symbol_found=True,
+        )
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, retrieved_data, self.env_java, descriptor=desc
+        )
+        self.assertTrue(is_val, f"Validation should succeed but failed with errors: {errs}")
+        self.assertEqual(len(errs), 0)
+
+    def test_validation_functional_test_null_route_success(self):
+        """Verify functional test with null route passes validation."""
+        code = """
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+// Test Case ID: TC-FUNC-01
+class WorkflowTest {
+    @Test
+    void testEndToEndSimulation() {
+        ElevatorSimulation sim = new ElevatorSimulation();
+        sim.addRequest(1);
+        sim.addRequest(2);
+        assertTrue(sim.hasRequests());
+    }
+}
+"""
+        tc = {
+            "testCaseId": "TC-FUNC-01",
+            "title": "End-to-end simulation workflow",
+            "testType": "functional",
+            "target": {
+                "file": "ElevatorSimulation.java",
+                "symbol": "addRequest",
+                "type": "method",
+                "route": None,
+            },
+        }
+        retrieved_data = {
+            "testType": "functional",
+            "source": {
+                "files": [
+                    {
+                        "path": "ElevatorSimulation.java",
+                        "reason": "primary_target",
+                        "sourceCode": "class ElevatorSimulation { void addRequest(int floor) {} boolean hasRequests() { return true; } }",
+                    }
+                ]
+            },
+        }
+        desc = TargetDescriptor(
+            target_symbol="addRequest",
+            target_file="ElevatorSimulation.java",
+            observed_methods=["addRequest", "hasRequests"],
+            is_symbol_found=True,
+        )
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, retrieved_data, self.env_java, descriptor=desc
+        )
+        self.assertTrue(is_val, f"Validation should succeed: {errs}")
+
+    def test_validation_api_test_valid_route_success(self):
+        """Verify API test with valid route passes validation when route is targeted."""
+        env_py = ProjectEnv(
+            language="python",
+            file_extension=".py",
+            test_framework="pytest",
+            test_framework_import="import pytest\nimport requests",
+        )
+        code = """import pytest
+import requests
+
+# Test Case ID: TC-API-01
+def test_get_users():
+    response = requests.get("http://localhost:5000/api/v1/users")
+    assert response.status_code == 200
+"""
+        tc = {
+            "testCaseId": "TC-API-01",
+            "title": "Get users endpoint",
+            "testType": "api",
+            "target": {
+                "file": "routes.py",
+                "symbol": "get_users",
+                "route": "/api/v1/users",
+                "httpMethod": "GET",
+            },
+        }
+        retrieved_data = {"testType": "api"}
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, retrieved_data, env_py
+        )
+        self.assertTrue(is_val, f"Validation should succeed: {errs}")
+        self.assertEqual(len(errs), 0)
+
+    def test_validation_api_test_missing_route_controlled_failure(self):
+        """Verify API test with missing or null route returns controlled TARGET_MISMATCH without crashing."""
+        env_py = ProjectEnv(
+            language="python",
+            file_extension=".py",
+            test_framework="pytest",
+            test_framework_import="import pytest\nimport requests",
+        )
+        code = """import pytest
+import requests
+
+# Test Case ID: TC-API-02
+def test_get_users():
+    response = requests.get("http://localhost:5000/api/v1/users")
+    assert response.status_code == 200
+"""
+        tc = {
+            "testCaseId": "TC-API-02",
+            "title": "Get users endpoint missing route",
+            "testType": "api",
+            "target": {
+                "file": "routes.py",
+                "symbol": "get_users",
+                "route": None,
+                "httpMethod": "GET",
+            },
+        }
+        retrieved_data = {"testType": "api"}
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, retrieved_data, env_py
+        )
+        self.assertFalse(is_val)
+        self.assertEqual(failure_type, "TARGET_MISMATCH")
+        self.assertTrue(any("missing required 'route'" in e for e in errs))
+
+    def test_validation_completely_null_metadata_no_crash(self):
+        """Verify that completely null or malformed target/test_case metadata does not raise unhandled exceptions."""
+        tc = {
+            "testCaseId": None,
+            "title": None,
+            "target": None,
+            "expectedResult": None,
+            "scenarioType": None,
+        }
+        code = "class DummyTest { void test() { assertTrue(true); } }"
+        is_val, cleaned, errs, failure_type = validate_generated_script(
+            code, tc, {}, self.env_java
+        )
+        self.assertFalse(is_val)
+        self.assertIsNotNone(failure_type)
+        self.assertIn("Test case is missing required 'testCaseId'.", errs)
+
 
 if __name__ == "__main__":
     unittest.main()
+

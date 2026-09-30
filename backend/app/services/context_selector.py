@@ -91,6 +91,8 @@ def resolve_test_type(
             return "integration", True
         if c_lower in ("functional", "e2e", "end-to-end", "workflow", "system", "scenario"):
             return "functional", True
+        if c_lower in ("api", "endpoint", "rest", "api_test", "http", "route"):
+            return "api", True
 
     # Safely infer from metadata if not explicitly specified
     if test_case and isinstance(test_case, dict):
@@ -101,15 +103,19 @@ def resolve_test_type(
             str(test_case.get("expectedResult") or "")
         ]).lower()
 
-        if any(term in text_corpus for term in ("e2e", "end-to-end", "user flow", "feature flow", "journey", "landing")):
+        if any(term in text_corpus for term in ("api", "endpoint", "status code", "http method", "request body", "query param", "route", "post /", "get /", "put /", "delete /", "patch /")):
+            return "api", False
+        if any(term in text_corpus for term in ("e2e", "end-to-end", "user flow", "feature flow", "journey", "landing", "page view", "user click")):
             return "functional", False
         if any(term in text_corpus for term in ("integration", "database roundtrip", "controller to service", "cross-file", "pipeline")):
             return "integration", False
 
     if target and isinstance(target, dict):
         t_type = str(target.get("type") or "").lower()
-        if t_type in ("route", "api_route", "endpoint"):
-            return "integration", False
+        if t_type in ("route", "api_route", "endpoint", "controller"):
+            return "api", False
+        if t_type in ("page", "view", "component", "screen", "workflow"):
+            return "functional", False
 
     return default, False
 
@@ -681,6 +687,28 @@ def clean_code_map_entry(raw_entry: dict, rel_path: str = "") -> dict:
             exports.append(ename)
     if exports:
         cleaned["exports"] = exports[:10]
+
+    # Routes (for API test context)
+    routes = []
+    for r in raw_entry.get("routes", []):
+        if isinstance(r, dict):
+            r_path = r.get("path") or r.get("route") or r.get("endpoint")
+            r_method = r.get("method") or r.get("httpMethod") or "GET"
+            if r_path:
+                routes.append({"path": r_path, "method": str(r_method).upper()})
+    if routes:
+        cleaned["routes"] = routes[:10]
+
+    # React / UI Components (for Functional test context)
+    react_meta = raw_entry.get("react")
+    if isinstance(react_meta, dict) and react_meta:
+        cleaned_react = {}
+        if react_meta.get("components"):
+            cleaned_react["components"] = react_meta["components"][:5]
+        if react_meta.get("hooks"):
+            cleaned_react["hooks"] = react_meta["hooks"][:5]
+        if cleaned_react:
+            cleaned["react"] = cleaned_react
 
     return cleaned
 
