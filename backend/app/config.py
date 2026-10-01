@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     analysis_timeout_seconds: int = 3600
     llm_json_repair_attempts: int = 1
     llm_graph_retry_attempts: int = 1
-    analysis_output_dir: Optional[str] = None
+    analysis_output_dir: Optional[str] = "C:\\Users\\Mohak\\Desktop\\test"
 
     class Config:
         env_file = ENV_PATH

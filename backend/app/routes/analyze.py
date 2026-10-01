@@ -192,8 +192,13 @@ def _find_code_map_on_disk(
 
     # 3. Base output directories discovery
     base_dirs: list[Path] = []
+    desktop_test = Path(r"C:\Users\Mohak\Desktop\test")
+    if desktop_test.is_dir():
+        base_dirs.append(desktop_test)
     if getattr(settings, "analysis_output_dir", None):
-        base_dirs.append(Path(settings.analysis_output_dir).resolve())
+        p_set = Path(settings.analysis_output_dir).resolve()
+        if p_set not in base_dirs:
+            base_dirs.append(p_set)
     env_out = os.environ.get("ANALYSIS_OUTPUT_DIR")
     if env_out and Path(env_out).resolve() not in base_dirs:
         base_dirs.append(Path(env_out).resolve())
